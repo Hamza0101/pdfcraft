@@ -318,9 +318,8 @@ fn info(args: &[String]) -> Result<(), CliError> {
         .flatten();
     // What the document declares as a standard, read the way the Standards panel reads it, so
     // `info` and the app agree. A file that declares nothing leaves these null and empty.
-    let declared = pdfcraft_cos::Document::open_with_password(std::sync::Arc::new(bytes.to_vec()), password)
-        .map(|doc| pdfcraft_preflight::declared(&doc))
-        .unwrap_or_default();
+    let declared =
+        pdfcraft_cos::Document::open_with_password(bytes.clone(), password).map(|doc| pdfcraft_preflight::declared(&doc)).unwrap_or_default();
     let json = serde_json::json!({
         "file": path,
         "pdf_version": info.pdf_version,
