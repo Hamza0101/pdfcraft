@@ -329,7 +329,7 @@ fn info(args: &[String]) -> Result<(), CliError> {
         "first_page_pt": info.pages.first().map(|p| [p.width, p.height]),
         "title": info.title, "author": info.author, "producer": info.producer, "creator": info.creator,
         "encrypted": info.encrypted, "tagged": info.tagged, "javascript": info.has_javascript,
-        "pdfa": declared.pdfa.as_ref().map(|(part, conformance)| format!("{part}{}", conformance.to_uppercase())),
+        "pdfa": declared.pdfa.as_ref().map(|(part, conformance)| format!("PDF/A-{part}{}", conformance.to_lowercase())),
         "pdfua": declared.pdfua,
         "output_intents": declared.output_intents,
         "xfa": info.xfa.map(|x| match x { pdfcraft_render::Xfa::Static => "static", pdfcraft_render::Xfa::Dynamic => "dynamic" }),

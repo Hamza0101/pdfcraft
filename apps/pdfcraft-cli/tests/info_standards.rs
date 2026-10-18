@@ -69,11 +69,11 @@ fn info_of(bytes: &[u8], name: &str) -> serde_json::Value {
 #[test]
 fn info_names_the_declared_pdfa_level() {
     let declared = info_of(&fixture(Some(&xmp("2", "B"))), "pdfa2b");
-    assert_eq!(declared["pdfa"], serde_json::json!("2B"), "{declared}");
+    assert_eq!(declared["pdfa"], serde_json::json!("PDF/A-2b"), "{declared}");
     assert_eq!(declared["pdfua"], serde_json::Value::Null);
     assert_eq!(declared["output_intents"], serde_json::json!([]));
     // Lower-case conformance in the file still reads as the level's own spelling.
-    assert_eq!(info_of(&fixture(Some(&xmp("3", "a"))), "pdfa3a")["pdfa"], serde_json::json!("3A"));
+    assert_eq!(info_of(&fixture(Some(&xmp("3", "a"))), "pdfa3a")["pdfa"], serde_json::json!("PDF/A-3a"));
 }
 
 #[test]
