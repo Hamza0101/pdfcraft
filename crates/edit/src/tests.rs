@@ -1264,7 +1264,7 @@ fn japanese_paragraph_refused_before_its_fallback_fonts_are_written() {
         ),
     ];
     for (content, style, message) in cases {
-        let mut doc = clipping_content_page(content);
+        let mut doc = text_page(content);
         let saved = write_incremental(&doc, &SaveOptions::default()).unwrap();
         let err = text::rewrite_block(&mut doc, 0, 0, Some("見本商会　御中"), &style).unwrap_err().to_string();
         assert!(err.contains(message), "{err}");
@@ -2973,7 +2973,7 @@ fn group_moves_preserve_glyph_bytes_and_unselected_text_state() {
         "q 1.2 0.3 -0.1 0.9 20 30 cm BT /F1 12 Tf 50 600 Td [(A) -120 (B)] TJ 1 0 0 rg (After) Tj ET Q %keep-this-comment\n",
         "BT /F1 12.3456789 Tf 81.23456789 Tz 0.123456789 Ts 14 TL 50 600 Td (Before) Tj 0 0 1 rg 2.123456789 1.987654321 (Quoted) \" 1 0 0 rg (After) Tj ET",
     ] {
-        let mut doc = clipping_content_page(content);
+        let mut doc = text_page(content);
         let before = text::text_lines(&doc, 0).unwrap();
         let blocks = text::text_blocks(&doc, 0).unwrap();
         let index = blocks.iter().position(|b| b.text.contains("Quoted")).unwrap_or(0);
@@ -4457,7 +4457,7 @@ fn kept_rows_stay_in_place_when_rows_wrap_or_move_with_quote_operators() {
         text::text_lines(doc, 0).unwrap().into_iter().map(|l| (l.text.clone(), l.baseline())).collect()
     };
     let edit = |content: &str, from: &str, to: &str| {
-        let mut doc = clipping_content_page(content);
+        let mut doc = text_page(content);
         let block = text::text_blocks(&doc, 0).unwrap().into_iter().position(|b| b.editor_text.contains(from)).unwrap();
         let draft = text::text_blocks(&doc, 0).unwrap()[block].editor_text.replacen(from, to, 1);
         text::rewrite_block(&mut doc, 0, block, Some(&draft), &text::BlockStyle::default()).unwrap();
@@ -4491,7 +4491,7 @@ fn kept_rows_stay_in_place_when_rows_wrap_or_move_with_quote_operators() {
 
 /// A page whose `/F1` is Inter embedded as a simple WinAnsi TrueType font, under `base_font`.
 fn embedded_program_page(content: &str, base_font: &str) -> Document {
-    let mut doc = clipping_content_page(content);
+    let mut doc = text_page(content);
     let program = doc.add(Object::Stream(Stream::flate(Dict::new(), include_bytes!("../../../assets/fonts/Inter-Regular.ttf"))));
     let mut descriptor = Dict::new();
     descriptor.set(b"Type".to_vec(), Object::name("FontDescriptor"));
@@ -4978,31 +4978,7 @@ fn flattening_comments_keeps_annotations_that_are_not_comments() {
 
 /// A page whose text is a clipping mask (`mode` Tr) with a fill painted through it.
 fn clipping_text_page(mode: i64) -> Document {
-    clipping_content_page(&format!("q\nBT {mode} Tr /F1 48 Tf 40 60 Td (MASK) Tj ET\n1 0 0 rg 0 0 300 150 re f\nQ\n"))
-}
-
-/// A 300x150 page with Helvetica as `/F1` and `content` as its content stream.
-fn clipping_content_page(content: &str) -> Document {
-    let objs: Vec<String> = vec![
-        "<< /Type /Catalog /Pages 2 0 R >>".into(),
-        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
-        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 150] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>".into(),
-        format!("<< /Length {} >>\nstream\n{content}\nendstream", content.len()),
-        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".into(),
-    ];
-    let mut out = b"%PDF-1.7\n".to_vec();
-    let mut offs = Vec::new();
-    for (i, o) in objs.iter().enumerate() {
-        offs.push(out.len());
-        out.extend_from_slice(format!("{} 0 obj\n{o}\nendobj\n", i + 1).as_bytes());
-    }
-    let x = out.len();
-    out.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1).as_bytes());
-    for o in offs {
-        out.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
-    }
-    out.extend_from_slice(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{x}\n%%EOF\n", objs.len() + 1).as_bytes());
-    Document::open(Arc::new(out)).unwrap()
+    text_page(&format!("q\nBT {mode} Tr /F1 48 Tf 40 60 Td (MASK) Tj ET\n1 0 0 rg 0 0 300 150 re f\nQ\n"))
 }
 
 /// Rewriting text that is a clipping path destroyed the artwork it masked: the glyphs went, the
@@ -5046,11 +5022,11 @@ fn painting_modes_are_still_rewritten() {
 #[test]
 fn a_line_that_starts_as_ink_and_continues_as_a_mask_is_refused() {
     let content = "q\nBT /F1 48 Tf 40 60 Td 0 Tr (TITLE) Tj 7 Tr (MASK) Tj ET\n1 0 0 rg 0 0 300 150 re f\nQ\n";
-    let before = text::text_lines(&clipping_content_page(content), 0).unwrap();
+    let before = text::text_lines(&text_page(content), 0).unwrap();
     assert_eq!(before.len(), 1, "the two runs are one line: {:?}", before.iter().map(|l| &l.text).collect::<Vec<_>>());
     assert_eq!(before[0].text, "TITLEMASK", "and the mask is the second half of it");
 
-    let mut doc = clipping_content_page(content);
+    let mut doc = text_page(content);
     let line = text::replace_line(&mut doc, 0, 0, "EDITED");
     assert!(matches!(&line, Err(EditError::Invalid(m)) if m.contains("clipping path")), "{line:?}");
     let block = text::rewrite_block(&mut doc, 0, 0, Some("EDITED"), &BlockStyle::default());
@@ -5064,10 +5040,10 @@ fn a_line_that_starts_as_ink_and_continues_as_a_mask_is_refused() {
 #[test]
 fn a_clipping_copy_on_the_same_baseline_is_refused() {
     let content = "q\nBT 0 Tr /F1 48 Tf 40 60 Td (MASK) Tj ET\nBT 7 Tr /F1 48 Tf 40 60 Td (MASK) Tj ET\n1 0 0 rg 0 0 300 150 re f\nQ\n";
-    let before = text::text_lines(&clipping_content_page(content), 0).unwrap();
+    let before = text::text_lines(&text_page(content), 0).unwrap();
     assert_eq!(before.len(), 2, "two drawings of the same line");
 
-    let mut doc = clipping_content_page(content);
+    let mut doc = text_page(content);
     let line = text::replace_line(&mut doc, 0, 0, "EDITED");
     assert!(matches!(&line, Err(EditError::Invalid(m)) if m.contains("clipping path")), "{line:?}");
     let block = text::rewrite_block(&mut doc, 0, 0, Some("EDITED"), &BlockStyle::default());
