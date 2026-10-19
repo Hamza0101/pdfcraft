@@ -2790,6 +2790,21 @@ fn images_can_be_created_on_a_paper_size() {
     ok(&mut a, "doc_combine", json!({ "paths": paths, "pageSize": "letter", "out": "combined.pdf" }));
     let combined = ok(&mut a, "doc_open", json!({ "path": "combined.pdf" }))["doc"].as_u64().unwrap();
     assert_eq!(sizes(&mut a, combined), vec![(612.0, 792.0), (612.0, 792.0)]);
+
+    // And one PDF per image, which goes down a separate path and so was ignoring the page size.
+    let separate = ok(&mut a, "doc_create_multiple", json!({ "paths": paths, "mode": "separate", "out_dir": "out", "pageSize": "a4" }));
+    let written = separate["files"].as_array().or(separate.as_array()).cloned().unwrap_or_default();
+    assert!(!written.is_empty(), "mode separate reports what it wrote: {separate}");
+    let mut checked = 0;
+    for entry in &written {
+        let Some(path) = entry["output"].as_str() else { continue };
+        checked += 1;
+        let doc = ok(&mut a, "doc_open", json!({ "path": path }))["doc"].as_u64().unwrap();
+        for (w, h) in sizes(&mut a, doc) {
+            assert!((w - 595.28).abs() < 0.01 && (h - 841.89).abs() < 0.01, "{path} on A4, not {w} x {h}");
+        }
+    }
+    assert_eq!(checked, 2, "both images were written and measured: {separate}");
 }
 
 #[test]

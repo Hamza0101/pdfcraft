@@ -1592,6 +1592,7 @@ impl Automation {
 
     /// One PDF per file, written into `out_dir`; a file that fails doesn't stop the others.
     fn create_separate(&mut self, a: &Args, paths: &[&str]) -> Result<Value> {
+        let page = image_page(a)?;
         let dir = self.resolve(a.str("out_dir").map_err(|_| ToolError::InvalidArgs("mode \"separate\" needs out_dir".into()))?, true)?;
         std::fs::create_dir_all(&dir).map_err(|e| failed(format!("{}: {e}", dir.display())))?;
         let mut out = Vec::new();
@@ -1600,7 +1601,7 @@ impl Automation {
                 let bytes = std::fs::read(&src).map_err(|e| format!("{}: {e}", src.display()))?;
                 let name = src.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 let stem = src.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "document".into());
-                let (kind, pdf) = self.session.convert_to_pdf(&name, &Arc::new(bytes)).map_err(|e| e.to_string())?;
+                let (kind, pdf) = self.session.convert_to_pdf_on_pages(&name, &Arc::new(bytes), page).map_err(|e| e.to_string())?;
                 Ok((kind, stem, pdf))
             });
             out.push(match converted {
