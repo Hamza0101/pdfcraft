@@ -4975,3 +4975,63 @@ fn flattening_comments_keeps_annotations_that_are_not_comments() {
     let without_widget: Vec<&str> = all.iter().copied().filter(|s| *s != "Widget").collect();
     assert_eq!(left(&reopen(&doc)), without_widget, "flattening fields touches no annotation that isn't a widget");
 }
+
+/// A page whose text is a clipping mask (`mode` Tr) with a fill painted through it.
+fn clipping_text_page(mode: i64) -> Document {
+    let content = format!("q\nBT {mode} Tr /F1 48 Tf 40 60 Td (MASK) Tj ET\n1 0 0 rg 0 0 300 150 re f\nQ\n");
+    let objs: Vec<String> = vec![
+        "<< /Type /Catalog /Pages 2 0 R >>".into(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 150] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>".into(),
+        format!("<< /Length {} >>\nstream\n{content}\nendstream", content.len()),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".into(),
+    ];
+    let mut out = b"%PDF-1.7\n".to_vec();
+    let mut offs = Vec::new();
+    for (i, o) in objs.iter().enumerate() {
+        offs.push(out.len());
+        out.extend_from_slice(format!("{} 0 obj\n{o}\nendobj\n", i + 1).as_bytes());
+    }
+    let x = out.len();
+    out.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1).as_bytes());
+    for o in offs {
+        out.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{x}\n%%EOF\n", objs.len() + 1).as_bytes());
+    Document::open(Arc::new(out)).unwrap()
+}
+
+/// Rewriting text that is a clipping path destroyed the artwork it masked: the glyphs went, the
+/// mask with them, and the fill behind flooded its own rectangle, in a file that still opened
+/// without a warning (#3429). Photoshop exports draw every text object this way. The rewrite is
+/// refused instead, as `clear_block` already refuses a preview.
+#[test]
+fn rewriting_clipping_path_text_is_refused_for_every_clipping_mode() {
+    for mode in [4, 5, 6, 7] {
+        let before = text::text_lines(&clipping_text_page(mode), 0).unwrap();
+        assert_eq!(before.len(), 1, "mode {mode}: the mask is one line");
+
+        let mut doc = clipping_text_page(mode);
+        let line = text::replace_line(&mut doc, 0, 0, "EDITED");
+        assert!(matches!(&line, Err(EditError::Invalid(m)) if m.contains("clipping path")), "mode {mode}: {line:?}");
+
+        let mut doc = clipping_text_page(mode);
+        let block = text::rewrite_block(&mut doc, 0, 0, Some("EDITED"), &BlockStyle::default());
+        assert!(matches!(&block, Err(EditError::Invalid(m)) if m.contains("clipping path")), "mode {mode}: {block:?}");
+
+        // Refused means untouched: the mask is still there to shape what is painted through it.
+        let after = text::text_lines(&doc, 0).unwrap();
+        assert_eq!(after.len(), 1, "mode {mode}");
+        assert_eq!(after[0].text, "MASK", "mode {mode}");
+    }
+}
+
+/// The modes that paint ink are still editable: only 4 to 7 add to the clip path.
+#[test]
+fn painting_modes_are_still_rewritten() {
+    for mode in [0, 1, 2] {
+        let mut doc = clipping_text_page(mode);
+        assert!(text::replace_line(&mut doc, 0, 0, "EDITED").is_ok(), "mode {mode}");
+        assert_eq!(text::text_lines(&doc, 0).unwrap()[0].text, "EDITED", "mode {mode}");
+    }
+}

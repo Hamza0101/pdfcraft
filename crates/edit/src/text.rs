@@ -1740,10 +1740,23 @@ pub fn replace_line(doc: &mut Document, page: usize, line: usize, text: &str) ->
 }
 
 /// [`replace_line`] with the most unique characters one generated font may hold (tests lower it).
+/// Refuses a rewrite of text drawn as a clipping path (`4 Tr` to `7 Tr`). Such glyphs are not ink
+/// but a mask, and whatever is painted through them takes their shape. Rewriting the run removes
+/// the glyphs and so the mask, and the fill or image behind floods its own rectangle instead --
+/// the artwork is destroyed, in a file that still opens without a warning (#3429). `clear_block`
+/// already refuses these for the same reason.
+fn refuse_clipping_text(mode: i64) -> Result<(), EditError> {
+    if mode >= 4 {
+        return Err(EditError::Invalid("text used as a clipping path cannot be edited: its glyphs mask the artwork behind them".into()));
+    }
+    Ok(())
+}
+
 pub(crate) fn replace_line_with_limit(doc: &mut Document, page: usize, line: usize, text: &str, max_glyphs: usize) -> Result<LineEdit, EditError> {
     let text = text.replace(['\n', '\r'], " ");
     let lines = text_lines(doc, page)?;
     let target = lines.get(line).cloned().ok_or_else(|| EditError::Invalid(format!("page {} has no line {}", page + 1, line + 1)))?;
+    refuse_clipping_text(target.origin.state.render_mode)?;
     let p = page_dict(doc, page)?;
     let mut res = p.dict.get(b"Resources").map(|r| doc.resolve(r)).and_then(|r| r.as_dict().cloned()).unwrap_or_default();
     let mut fonts_res = res.get(b"Font").map(|f| doc.resolve(f)).and_then(|f| f.as_dict().cloned()).unwrap_or_default();
@@ -2062,6 +2075,10 @@ fn rewrite_block_from(
 ) -> Result<LineEdit, EditError> {
     let blocks = group_blocks(&lines);
     let b = blocks.get(block).cloned().ok_or_else(|| EditError::Invalid(format!("page {} has no paragraph {}", page + 1, block + 1)))?;
+    // One clipping line is enough: rewriting the paragraph would drop its mask with the rest.
+    for mode in b.lines.iter().filter_map(|i| lines.get(*i)).map(|l| l.origin.state.render_mode) {
+        refuse_clipping_text(mode)?;
+    }
     let members: Vec<&TextLine> = b.lines.iter().map(|i| &lines[*i]).collect();
     let first = members.first().copied().ok_or_else(|| EditError::Invalid("the paragraph has no source runs".into()))?;
     let p = page_dict(doc, page)?;
