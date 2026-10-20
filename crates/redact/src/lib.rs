@@ -22,6 +22,7 @@ pub mod codes;
 mod image;
 mod interp;
 mod overlay;
+mod pattern_guard;
 pub mod patterns;
 pub mod sanitize;
 mod tags;
@@ -29,6 +30,7 @@ mod tags;
 mod tests;
 
 use interp::{Mode, Scope, process};
+pub use pattern_guard::PatternProblem;
 
 pub type Rgb = [f64; 3];
 
@@ -47,6 +49,8 @@ pub enum RedactError {
         "page {0} has vertical-writing text while a redaction mark is pending, and PdfCraft cannot tell whether that text lies under the mark yet, so nothing was changed"
     )]
     VerticalText(usize),
+    #[error("page {page} cannot be redacted safely: {reason}; nothing was changed")]
+    Pattern { page: usize, reason: PatternProblem },
     #[error(
         "redaction appearance has invalid geometry or exceeds the 8 MiB budget; reduce the marked area, turn off repeated text or apply fewer pages at once (nothing was redacted)"
     )]
@@ -317,9 +321,9 @@ fn localize_resources(doc: &mut Document, selected: &[usize]) -> Result<(), pdfc
 ///
 /// # Errors
 ///
-/// This operation is not transactional: an error may leave `doc` partially modified, with
-/// sensitive content still present. Call this on a working clone and replace the original only
-/// on success. On any error, discard the working clone; do not save or reuse it.
+/// This operation is not generally transactional: an error may leave `doc` partially modified.
+/// Callers should use a working clone and replace the original only on success. A retained-pattern
+/// refusal restores the document and its pending marks even for direct callers.
 pub fn apply(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, RedactError> {
     let all_marks = marks(doc);
     let chosen: Vec<&Mark> = all_marks.iter().filter(|m| pages.is_none_or(|p| p.contains(&m.page))).collect();
@@ -345,6 +349,17 @@ pub fn apply(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, Reda
         .iter()
         .map(|&(pi, page_marks)| overlay::content(page_marks, &mut remaining).map(|content| (pi, content)))
         .collect::<Result<Vec<_>, _>>()?;
+    // A pattern pruned from a selected page can remain reachable through another page's
+    // resources. When a selected page had patterns, inspect every page after the rewrite.
+    let source_pages = pdfcraft_model::pages(doc);
+    let shared_pattern_possible = by_page.iter().any(|&pi| {
+        source_pages
+            .get(pi)
+            .and_then(|page| page.dict.get(b"Resources"))
+            .map(|resources| doc.resolve(resources))
+            .is_some_and(|resources| resources.as_dict().is_some_and(|dict| dict.get(b"Pattern").is_some()))
+    });
+    let before_pattern_check = doc.clone();
     report.pages = by_page.len();
     localize_resources(doc, &by_page)?;
     let mut doomed_fields: Vec<String> = Vec::new();
@@ -570,6 +585,14 @@ pub fn apply(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, Reda
     }
     if residue > 0 {
         return Err(RedactError::Residue(residue));
+    }
+    // The interpreter can remove a pattern's paint while another use keeps the cell reachable.
+    // Inspect the finished selected pages, including rewritten Forms, before publishing the
+    // working copy. Unreadable or text/image-bearing retained cells must refuse the redaction.
+    let check_pages = if shared_pattern_possible { (0..pdfcraft_model::pages(doc).len()).collect::<Vec<_>>() } else { by_page };
+    if let Err(error) = pattern_guard::check(doc, &check_pages) {
+        *doc = before_pattern_check;
+        return Err(error);
     }
     // The previous revision still holds the removed content: the next save must rewrite.
     doc.require_full_save();
