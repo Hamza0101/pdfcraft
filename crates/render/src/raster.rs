@@ -4591,6 +4591,46 @@ trailer << /Root 1 0 R >>
         assert!(grey[0] == grey[1] && grey[1] == grey[2] && grey[0] < 255, "the image covers the page: {grey:?}");
     }
 
+    /// A malformed token in a content stream used to end the stream there, so the renderer, text
+    /// extraction, Find and search-based redaction lost the rest of the page while the edit
+    /// reader, MuPDF and pdftotext read it (#3565, #3568). Each token below is now stepped over.
+    #[test]
+    fn a_malformed_token_does_not_end_the_content_stream() {
+        // One token between two text objects. `BEFORE` is drawn before it, `AFTER` after.
+        let page = |token: &str| {
+            let stream = format!("BT /F1 8 Tf 2 30 Td (BEFORE) Tj ET {token} BT /F1 8 Tf 2 10 Td (AFTER) Tj ET");
+            let mut pdf = b"%PDF-1.7\n1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 60 40] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >> endobj\n5 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj\n".to_vec();
+            pdf.extend_from_slice(format!("4 0 obj << /Length {} >> stream\n", stream.len()).as_bytes());
+            pdf.extend_from_slice(stream.as_bytes());
+            pdf.extend_from_slice(b"\nendstream endobj\ntrailer << /Root 1 0 R >>\n%%EOF\n");
+            let mut renderer = PageRenderer::new(Arc::new(pdf), RenderConfig::default());
+            let text = renderer.render(RenderRequest { page: 0, kind: RequestKind::Text, ..Default::default() });
+            assert!(text.error.is_none(), "{token}: {:?}", text.error);
+            text.text.expect("a text layer").plain_text()
+        };
+
+        for token in [
+            // A `re` with three operands: the typed iterator used to abort on a path operator it
+            // could not dispatch, which is what #3568 reports.
+            "20 10 10 re",
+            // More operands than the limit (ISO 32000-2 Annex C gives 10): the instruction is
+            // dropped, not the stream.
+            "0 0 0 0 0 0 0 0 0 0 0 g",
+            // A stray delimiter: the lexer could not read an operator and jumped to the end.
+            ")",
+            // A malformed `#` escape in a name, so neither an object nor an operator read.
+            "/C#2 gs",
+            // And the well-formed forms still work.
+            "20 10 10 5 re n",
+            "0.5 g",
+        ] {
+            let text = page(token);
+            assert!(text.contains("BEFORE"), "{token}: {text:?}");
+            assert!(text.contains("AFTER"), "{token}: the rest of the page was lost: {text:?}");
+            assert!(text.find("BEFORE") < text.find("AFTER"), "{token}: the page is read in order: {text:?}");
+        }
+    }
+
     /// A one-page PDF whose content is the stream `stream`, with the entries `dict` in its
     /// dictionary.
     fn one_page_pdf(stream: &[u8], dict: &str) -> Vec<u8> {

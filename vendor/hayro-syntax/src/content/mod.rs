@@ -40,7 +40,7 @@ use crate::object::name::{Name, skip_name_like};
 use crate::object::{Array, Null, Number, Object, Stream};
 use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, ReaderExt, Skippable};
-use crate::trivia::{Comment, is_white_space_character};
+use crate::trivia::{Comment, is_regular_character, is_white_space_character};
 use crate::util::find_needle;
 use core::array;
 use core::fmt::{Debug, Formatter};
@@ -172,6 +172,11 @@ impl<'a> UntypedIter<'a> {
             self.committed = self.skip_blanks_and_comments();
         }
 
+        // PdfCraft patch: set when this instruction carried more operands than the limit. Its
+        // operator is then dropped with them, rather than applied to the ones that did fit
+        // (#3568).
+        let mut overflowed = false;
+
         while !self.reader.at_end() {
             // I believe booleans/null never appear as an operator?
             if matches!(
@@ -189,14 +194,31 @@ impl<'a> UntypedIter<'a> {
                     if self.undecided() {
                         return None;
                     }
-                    self.stack.push(object)?;
+                    if self.stack.push(object).is_none() {
+                        overflowed = true;
+                    }
                 } else if self.reader.read_without_context::<Operator<'_>>().is_some() {
                     if self.undecided() {
                         return None;
                     }
                     self.stack.clear();
+                } else if self.undecided() {
+                    return None;
+                } else if self.reader.peek_byte() == Some(b'/') && self.skip_bad_token() {
+                    // PdfCraft patch: a name the lexer cannot read -- a malformed `#` escape, as
+                    // in `/C#2 gs` -- used to end the stream, losing the rest of the page. Step
+                    // over it and carry on, as the edit reader and other readers do (#3568).
+                    //
+                    // Only a name. An operand that is well formed but refused by a resource cap
+                    // (a dictionary nested past the limit) still ends the stream, which is what
+                    // `dictionaries_nested_without_keys_are_read_up_to_the_nesting_cap` in
+                    // pdfcraft's renderer asserts: reading on there would draw a page whose
+                    // content was deliberately not parsed.
+                    warn!("skipped an unreadable name in content stream");
+                    self.stack.clear();
+                    overflowed = false;
+                    continue;
                 } else {
-                    self.undecided();
                     return None;
                 }
             } else {
@@ -208,6 +230,14 @@ impl<'a> UntypedIter<'a> {
                         }
 
                         warn!("failed to read operator in content stream");
+
+                        // PdfCraft patch: a stray delimiter (`)`, say) ended the stream here, so
+                        // the rest of the page was lost. Step over it and carry on (#3568).
+                        if self.skip_bad_token() {
+                            self.stack.clear();
+                            overflowed = false;
+                            continue;
+                        }
 
                         self.reader.jump_to_end();
                         return None;
@@ -402,6 +432,17 @@ impl<'a> UntypedIter<'a> {
                     }
                 }
 
+                if overflowed {
+                    // PdfCraft patch: see `overflowed` above. ISO 32000-2 Annex C gives 10 as the
+                    // historical operand limit; past it the instruction is dropped whole.
+                    warn!("dropped an instruction with more operands than the limit");
+                    self.stack.clear();
+                    overflowed = false;
+                    self.committed = self.reader.offset();
+                    self.reader.skip_white_spaces_and_comments();
+                    continue;
+                }
+
                 self.operator = Some(operator);
                 self.committed = self.reader.offset();
                 return Some(Instruction {
@@ -439,6 +480,35 @@ impl<'a> UntypedIter<'a> {
         }
 
         open_comment.unwrap_or(self.reader.offset())
+    }
+
+    /// PdfCraft patch: step over one token the lexer could not read, so the rest of the stream is
+    /// still read instead of the page ending there. A delimiter stands alone; anything else runs
+    /// to the next delimiter or space. At least one byte is always consumed when this returns
+    /// true, so the loop in `next` cannot spin (#3568).
+    fn skip_bad_token(&mut self) -> bool {
+        let before = self.reader.offset();
+        match self.reader.peek_byte() {
+            None => return false,
+            // Never step over a good token: called where the blanks after the last one have not
+            // been skipped yet, there is nothing bad here to skip. Skipping ` BT` cost the page
+            // its second text object while this was being written.
+            Some(b) if is_white_space_character(b) || b == b'%' => {}
+            // A name reads to the next delimiter, malformed escapes included.
+            Some(b'/') => {
+                let _ = skip_name_like(&mut self.reader, true);
+            }
+            // A delimiter stands alone; anything else runs to the next delimiter or space.
+            _ => {
+                if self.reader.read_byte().is_none() {
+                    return false;
+                }
+                self.reader.forward_while(is_regular_character);
+            }
+        }
+        // Land on the next token, as the end of the loop in `next` does.
+        self.reader.skip_white_spaces_and_comments();
+        self.reader.offset() > before
     }
 
     /// PdfCraft patch: whether the instruction being read ran into the end of a window, so it
@@ -522,23 +592,12 @@ where
             // operator was used, let's abort completely, otherwise we might end up drawing random stuff.
             // However, for other operators it could be worth it to just skip it but keep attempting
             // to read other content operators.
-            None => {
-                if [
-                    &b"m"[..],
-                    &b"l"[..],
-                    &b"c"[..],
-                    &b"v"[..],
-                    &b"y"[..],
-                    &b"h"[..],
-                    &b"re"[..],
-                ]
-                .contains(&op.operator.0.deref())
-                {
-                    None
-                } else {
-                    Some(TypedInstruction::Fallback(op.operator))
-                }
-            }
+            // PdfCraft patch: a path operator whose operands do not fit it contributes nothing to
+            // the path, so skipping it leaves the path as it was -- the same state the abort
+            // below used to leave it in, except that the rest of the page is still read. Ending
+            // the stream here lost every later operator, and with it the rest of the page, its
+            // text and anything a redaction search would have matched (#3568).
+            None => Some(TypedInstruction::Fallback(op.operator)),
         }
     }
 }
