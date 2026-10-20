@@ -4618,6 +4618,10 @@ trailer << /Root 1 0 R >>
             "0 0 0 0 0 0 0 0 0 0 0 g",
             // A stray delimiter: the lexer could not read an operator and jumped to the end.
             ")",
+            // The same with no space after it. Stepping over the regular characters that follow a
+            // delimiter ate the next operator, so the page lost its second text object
+            // (#3636 review); only the delimiter is stepped over.
+            ")BT ET",
             // A malformed `#` escape in a name, so neither an object nor an operator read.
             "/C#2 gs",
             // And the well-formed forms still work.
@@ -4629,6 +4633,35 @@ trailer << /Root 1 0 R >>
             assert!(text.contains("AFTER"), "{token}: the rest of the page was lost: {text:?}");
             assert!(text.find("BEFORE") < text.find("AFTER"), "{token}: the page is read in order: {text:?}");
         }
+    }
+
+    /// Content after an inline image whose data holds `EI` is still read. This pins the property
+    /// but does **not** exercise the look-ahead gating added for #3636's review: accepting a false
+    /// `EI` truncates the image, while the text after the real one is read either way, and this
+    /// assertion passes with the gating removed. Showing the truncation needs valid ASCII85 data
+    /// that contains `EI`, which this fixture does not have.
+    #[test]
+    fn content_after_an_inline_image_holding_ei_is_still_read() {
+        // An ASCII85 image whose data holds `EI\n`, then an `re` with three operands and twenty
+        // `q`s -- enough steps to satisfy the look-ahead's counter if the bad `re` were skipped --
+        // before the real `EI`. `AFTER` is drawn once the image is over.
+        let stream = b"q 100 0 0 100 10 10 cm BI /W 4 /H 4 /CS /G /BPC 8 /F /A85 ID EI
+20 10 10 re q q q q q q q q q q q q q q q q q q q q EI Q BT /F1 8 Tf 2 4 Td (AFTER) Tj ET"
+            .to_vec();
+        let mut pdf =
+            b"%PDF-1.7\n1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 120 120] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >> endobj\n5 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj\n"
+                .to_vec();
+        pdf.extend_from_slice(format!("4 0 obj << /Length {} >> stream\n", stream.len()).as_bytes());
+        pdf.extend_from_slice(&stream);
+        pdf.extend_from_slice(b"\nendstream endobj\ntrailer << /Root 1 0 R >>\n%%EOF\n");
+
+        let mut renderer = PageRenderer::new(Arc::new(pdf), RenderConfig::default());
+        let text = renderer.render(RenderRequest { page: 0, kind: RequestKind::Text, ..Default::default() });
+        assert!(text.error.is_none(), "{:?}", text.error);
+        let page = text.text.expect("a text layer").plain_text();
+        // The image ran to the real `EI`, so the text after it is the page's only text: the first
+        // `EI` inside the data was not taken for the end.
+        assert!(page.contains("AFTER"), "the content after the image was lost: {page:?}");
     }
 
     /// A one-page PDF whose content is the stream `stream`, with the entries `dict` in its

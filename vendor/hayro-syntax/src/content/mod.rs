@@ -108,6 +108,15 @@ const MAX_EI_LOOKAHEAD_STEPS: u32 = 256;
 pub trait ContentTokenizer<'a> {
     /// Return the next instruction, or `None` after the content stream ends or becomes invalid.
     fn next_instruction<'b>(&'b mut self) -> Option<Instruction<'b, 'a>>;
+
+    /// PdfCraft patch: whether this tokenizer is only judging whether bytes read as content, as
+    /// the look-ahead past a candidate `EI` does. Such a pass must not recover from a malformed
+    /// token: its whole purpose is to find out whether the bytes are content, and answering
+    /// "yes, once the bad parts are skipped" of an inline image's data would cut the image at a
+    /// false `EI` (#3636 review).
+    fn judging_only(&self) -> bool {
+        false
+    }
 }
 
 /// An iterator over operators in the PDF content streams, providing raw access to the
@@ -204,7 +213,7 @@ impl<'a> UntypedIter<'a> {
                     self.stack.clear();
                 } else if self.undecided() {
                     return None;
-                } else if self.reader.peek_byte() == Some(b'/') && self.skip_bad_token() {
+                } else if !self.lookahead && self.reader.peek_byte() == Some(b'/') && self.skip_bad_token() {
                     // PdfCraft patch: a name the lexer cannot read -- a malformed `#` escape, as
                     // in `/C#2 gs` -- used to end the stream, losing the rest of the page. Step
                     // over it and carry on, as the edit reader and other readers do (#3568).
@@ -233,7 +242,7 @@ impl<'a> UntypedIter<'a> {
 
                         // PdfCraft patch: a stray delimiter (`)`, say) ended the stream here, so
                         // the rest of the page was lost. Step over it and carry on (#3568).
-                        if self.skip_bad_token() {
+                        if !self.lookahead && self.skip_bad_token() {
                             self.stack.clear();
                             overflowed = false;
                             continue;
@@ -432,7 +441,7 @@ impl<'a> UntypedIter<'a> {
                     }
                 }
 
-                if overflowed {
+                if overflowed && !self.lookahead {
                     // PdfCraft patch: see `overflowed` above. ISO 32000-2 Annex C gives 10 as the
                     // historical operand limit; past it the instruction is dropped whole.
                     warn!("dropped an instruction with more operands than the limit");
@@ -498,13 +507,14 @@ impl<'a> UntypedIter<'a> {
             Some(b'/') => {
                 let _ = skip_name_like(&mut self.reader, true);
             }
-            // A delimiter stands alone; anything else runs to the next delimiter or space.
-            _ => {
-                if self.reader.read_byte().is_none() {
-                    return false;
-                }
+            // A token of regular characters runs to the next delimiter or space.
+            Some(b) if is_regular_character(b) => {
                 self.reader.forward_while(is_regular_character);
             }
+            // A delimiter stands alone. Consuming what follows it would eat the next operator:
+            // `)BT` cost the page its second text object while this was being written
+            // (#3636 review).
+            Some(_) => self.reader.forward(),
         }
         // Land on the next token, as the end of the loop in `next` does.
         self.reader.skip_white_spaces_and_comments();
@@ -525,6 +535,10 @@ impl<'a> UntypedIter<'a> {
 impl<'a> ContentTokenizer<'a> for UntypedIter<'a> {
     fn next_instruction<'b>(&'b mut self) -> Option<Instruction<'b, 'a>> {
         self.next()
+    }
+
+    fn judging_only(&self) -> bool {
+        self.lookahead
     }
 }
 
@@ -584,6 +598,8 @@ where
     /// Return the next typed instruction.
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<TypedInstruction<'_, 'a>> {
+        // Read before the instruction borrows the tokenizer.
+        let judging = self.untyped.judging_only();
         let op = self.untyped.next_instruction()?;
         // TODO: Explore whether dispatching can be made more efficient.
         match TypedInstruction::dispatch(&op) {
@@ -597,7 +613,18 @@ where
             // below used to leave it in, except that the rest of the page is still read. Ending
             // the stream here lost every later operator, and with it the rest of the page, its
             // text and anything a redaction search would have matched (#3568).
-            None => Some(TypedInstruction::Fallback(op.operator)),
+            None => {
+                // A pass that is only judging whether bytes read as content must still stop at a
+                // path operator it cannot dispatch: counting it as a step would let an inline
+                // image's data pass for a content stream and cut the image at a false `EI`
+                // (#3636 review).
+                if judging
+                    && [&b"m"[..], &b"l"[..], &b"c"[..], &b"v"[..], &b"y"[..], &b"h"[..], &b"re"[..]].contains(&op.operator.0.deref())
+                {
+                    return None;
+                }
+                Some(TypedInstruction::Fallback(op.operator))
+            }
         }
     }
 }
