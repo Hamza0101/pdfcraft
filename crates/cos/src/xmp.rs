@@ -127,20 +127,32 @@ fn element_inner<'a>(packet: &'a str, name: &str) -> Option<&'a str> {
 
 /// The value of the attribute `name`, which counts only inside a start tag: a packet whose
 /// `<dc:description>` text says `dc:title="no"` doesn't state a title.
+///
+/// The start tags are walked once and the name looked for inside each. Finding the name first and
+/// then scanning back for the `<` that encloses it is quadratic: a packet that repeats the name
+/// with no angle bracket anywhere makes every occurrence scan the whole prefix, so 16 MiB of it
+/// -- a few kilobytes once deflated -- is on the order of 10^13 byte comparisons, six times over
+/// for the six entries `doc_info` reads from a packet.
 fn attribute_value(packet: &str, name: &str) -> Option<String> {
-    let mut from = 0;
-    while let Some(i) = packet.get(from..).and_then(|s| s.find(name)).map(|i| i + from) {
-        from = i + name.len();
-        let before = packet.get(..i)?;
-        // Preceded by whitespace, and inside a tag (the last `<` comes after the last `>`).
-        if !before.ends_with(char::is_whitespace) || before.rfind('<') < before.rfind('>') || before.rfind('<').is_none() {
-            continue;
+    // Everything before the first `<` is text; each piece after one begins a tag.
+    for piece in packet.split('<').skip(1) {
+        // XML allows an unescaped `>` in an attribute value, which XMP writers escape anyway;
+        // one here ends the tag for this scan, so the property is missed rather than misread.
+        let Some(tag) = piece.find('>').and_then(|e| piece.get(..e)) else { continue };
+        let mut from = 0;
+        while let Some(at) = tag.get(from..).and_then(|s| s.find(name)).map(|i| i + from) {
+            from = at + name.len();
+            // Preceded by whitespace, so the tag's own name is not one of its attributes and
+            // `xmp:dc:title` is not `dc:title`.
+            if !tag.get(..at).is_some_and(|before| before.ends_with(char::is_whitespace)) {
+                continue;
+            }
+            let Some(after_eq) = tag.get(from..).map(str::trim_start).and_then(|s| s.strip_prefix('=')) else { continue };
+            let after_eq = after_eq.trim_start();
+            let Some(quote) = after_eq.chars().next().filter(|c| matches!(c, '"' | '\'')) else { continue };
+            let value = after_eq.get(1..)?;
+            return Some(unescape(value.get(..value.find(quote)?)?));
         }
-        let Some(after_eq) = packet.get(from..)?.trim_start().strip_prefix('=') else { continue };
-        let after_eq = after_eq.trim_start();
-        let Some(quote) = after_eq.chars().next().filter(|c| matches!(c, '"' | '\'')) else { continue };
-        let value = after_eq.get(1..)?;
-        return Some(unescape(value.get(..value.find(quote)?)?));
     }
     None
 }
@@ -220,6 +232,22 @@ mod tests {
         assert_eq!(property("<dc:title", "dc:title"), None);
         assert_eq!(property("<rdf:Description dc:title=", "dc:title"), None);
         assert_eq!(property("", "dc:title"), None);
+    }
+
+    /// A packet that repeats the property's name outside any tag states nothing, and finding that
+    /// out costs one pass over it. Searching back from each occurrence for the `<` that encloses
+    /// it was quadratic: this packet, 9 MB and a few kilobytes once deflated, took on the order of
+    /// 10^13 byte comparisons -- hours -- where the pass takes milliseconds, so the bound below
+    /// has a margin of about a thousand and is not a measurement of the machine.
+    #[test]
+    fn a_name_repeated_outside_any_tag_is_read_in_one_pass() {
+        let packet = " dc:title".repeat(1 << 20);
+        let started = std::time::Instant::now();
+        assert_eq!(property(&packet, "dc:title"), None);
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
+        // The same text inside a tag does state it, however many times it is repeated beside it.
+        let stated = format!("{packet}<rdf:Description dc:title=\"Quarterly report\"/>");
+        assert_eq!(property(&stated, "dc:title").as_deref(), Some("Quarterly report"));
     }
 
     #[test]
