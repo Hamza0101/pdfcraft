@@ -941,9 +941,12 @@ fn across_in_columns(glyphs: &[Drawn], across: &[usize], down: &[usize], w: f32)
         // often *not* squeezed into its width, so its box need not be inside the column's; a
         // horizontal heading above a column is wider than this and has more glyphs than
         // `MAX_ACROSS`, so it stays a flow of its own.
-        let Some((col, boxes)) = columns.iter().find(|(c, _)| {
+        let Some((col, boxes)) = columns.iter().find(|(c, boxes)| {
             let cw = (c[2] - c[0]).max(0.1);
-            ((c[0] + c[2]) / 2.0 - centre).abs() <= cw * 0.5 && rw <= cw * 2.5 && rh <= cw * 1.4 && run_box[3] >= c[1] - cw && run_box[1] <= c[3] + cw
+            // Beside one of the column's own characters, not merely within the span they cover: a
+            // run centred in a large gap in the column is not part of it (#3812 review).
+            let beside = boxes.iter().any(|b| run_box[3] >= b[1] - cw && run_box[1] <= b[3] + cw);
+            ((c[0] + c[2]) / 2.0 - centre).abs() <= cw * 0.5 && rw <= cw * 2.5 && rh <= cw * 1.4 && beside
         }) else {
             continue;
         };
@@ -992,8 +995,13 @@ fn stacked_down(glyphs: &[Drawn], ids: &[usize]) -> Vec<bool> {
         let h = (p[3] - p[1]).max(g[3] - g[1]).max(0.1);
         let w = (p[2] - p[0]).max(g[2] - g[0]).max(0.1);
         let centre = |r: [f32; 4]| (r[0] + r[2]) / 2.0;
-        let step = g[1] - p[1];
-        (centre(g) - centre(p)).abs() <= w * 0.3 && step > h * 0.5 && step < h * 1.8 && cjk(a) && cjk(b)
+        // The next glyph begins where this one ends. A gap of its own is a line gap, not a column:
+        // one-character lines centred under each other step down by 1.2 of their height and more,
+        // and they are lines (#3812 review). A column's characters touch -- an OCR layer places
+        // them at the pitch it measured, so a little overlap or a twelfth of a height between them
+        // still counts, and a wider gap than that is left to the lines it looks like.
+        let gap = g[1] - p[3];
+        (centre(g) - centre(p)).abs() <= w * 0.3 && gap > -h * 0.3 && gap <= h * 0.12 && cjk(a) && cjk(b)
     };
     // Maximal runs in content order; `ids` is ascending, so neighbours here were drawn in turn.
     let mut start = 0;
@@ -2417,9 +2425,9 @@ mod tests {
         };
         let cid = |ch: char| chars.iter().position(|c| *c == ch).unwrap_or(0) + 1;
 
-        // One page: `columns` down the page, `gap` points apart, 12 pt characters touching.
-        // `across`: the same characters in rows instead, to show horizontal text is untouched.
-        let page = |gap: f64, across: bool| {
+        // One page holding `body`, with /CH a CID font whose `/ToUnicode` maps this page's
+        // characters and /F1 Helvetica.
+        let render = |body: String| {
             let mut doc = Document::with_version("1.7");
             let bfchar: String = chars
                 .iter()
@@ -2438,25 +2446,17 @@ mod tests {
                 "Type" => "Font", "Subtype" => "CIDFontType0", "BaseFont" => "TestStacked", "DW" => 1000,
                 "CIDSystemInfo" => dictionary! { "Registry" => Object::string_literal("Adobe"), "Ordering" => Object::string_literal("Identity"), "Supplement" => 0 },
             });
-            let font = doc.add_object(dictionary! {
+            let cjk_font = doc.add_object(dictionary! {
                 "Type" => "Font", "Subtype" => "Type0", "BaseFont" => "TestStacked", "Encoding" => "Identity-H",
                 "DescendantFonts" => vec![Object::Reference(descendant)], "ToUnicode" => to_unicode,
             });
-            let mut body = String::from("BT /F1 12 Tf ");
-            for (i, col) in columns.iter().enumerate() {
-                for (j, ch) in col.chars().enumerate() {
-                    let (x, y) =
-                        if across { (40.0 + 12.0 * j as f64, 250.0 - 18.0 * i as f64) } else { (250.0 - gap * i as f64, 250.0 - 12.0 * j as f64) };
-                    body += &format!("1 0 0 1 {x} {y} Tm <{:04X}> Tj ", cid(ch));
-                }
-            }
-            body += "ET";
+            let latin = doc.add_object(dictionary! { "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica" });
             let content = doc.add_object(Stream::new(dictionary! {}, body.into_bytes()));
             let pages = doc.new_object_id();
             let page = doc.add_object(dictionary! {
                 "Type" => "Page", "Parent" => pages, "Contents" => content,
                 "MediaBox" => vec![Object::Integer(0), Object::Integer(0), Object::Integer(300), Object::Integer(300)],
-                "Resources" => dictionary! {"Font" => dictionary! {"F1" => font}},
+                "Resources" => dictionary! {"Font" => dictionary! {"CH" => cjk_font, "F1" => latin}},
             });
             doc.objects.insert(pages, dictionary! {"Type" => "Pages", "Kids" => vec![Object::Reference(page)], "Count" => 1}.into());
             let catalog = doc.add_object(dictionary! {"Type" => "Catalog", "Pages" => pages});
@@ -2465,6 +2465,21 @@ mod tests {
             doc.save_to(&mut bytes).unwrap();
             let pdf = Pdf::new(std::sync::Arc::new(bytes)).unwrap();
             extract_page(&pdf, 0, &InterpreterSettings::default()).unwrap()
+        };
+
+        // `columns` down the page, `gap` points apart, 12 pt characters touching; `across`: the
+        // same characters in rows instead, to show horizontal text is untouched.
+        let page = |gap: f64, across: bool| {
+            let mut body = String::from("BT /CH 12 Tf ");
+            for (i, col) in columns.iter().enumerate() {
+                for (j, ch) in col.chars().enumerate() {
+                    let (x, y) =
+                        if across { (40.0 + 12.0 * j as f64, 250.0 - 18.0 * i as f64) } else { (250.0 - gap * i as f64, 250.0 - 12.0 * j as f64) };
+                    body += &format!("1 0 0 1 {x} {y} Tm <{:04X}> Tj ", cid(ch));
+                }
+            }
+            body += "ET";
+            render(body)
         };
 
         // Right to left: the rightmost column is the first line, at every column spacing.
@@ -2487,6 +2502,22 @@ mod tests {
         let text = page(18.0, false);
         let all = text.glyphs_in([0.0, 0.0, 300.0, 300.0]);
         assert_eq!(text.column_text(&all), columns.join("\n"));
+
+        // Centred one-character lines are lines, not a column: they step down by more than their
+        // own height, so there is a gap between them where a column has none. They keep their
+        // horizontal writing direction, and a word beside the first of them reads with it (#3812
+        // review).
+        for pitch in [1.2, 1.35, 1.5] {
+            let mut body = String::from("BT /F1 12 Tf 1 0 0 1 116 250 Tm (and) Tj ET BT /CH 12 Tf ");
+            for (j, ch) in "春天來".chars().enumerate() {
+                let y = 250.0 - 12.0 * pitch * j as f64;
+                body += &format!("1 0 0 1 100 {y} Tm <{:04X}> Tj ", cid(ch));
+            }
+            body += "ET";
+            let text = render(body);
+            assert!(text.glyphs.iter().all(|g| g.direction[1].abs() < 0.5), "lines, not a column, at pitch {pitch}");
+            assert_eq!(text.plain_text(), "春 and\n天\n來", "pitch {pitch}");
+        }
     }
 
     /// #3711: a number set across a vertical column (縱中橫, tate-chu-yoko), as in
@@ -2501,7 +2532,7 @@ mod tests {
         // Two columns, read right to left, each with numbers set across: the right one starts with
         // a number (so it is not between two of the column's characters) and the left has one in
         // the middle. `heading`: a horizontal line above them, which must stay a line of its own.
-        let page = |heading: bool| {
+        let render = |body: String| {
             let chars: Vec<char> = "年月日出版第頁共有三段".chars().collect();
             let cid = |ch: char| chars.iter().position(|c| *c == ch).unwrap_or(0) + 1;
             let mut doc = Document::with_version("1.7");
@@ -2528,29 +2559,6 @@ mod tests {
                 "DescendantFonts" => vec![Object::Reference(descendant)], "ToUnicode" => to_unicode,
             });
             let latin = doc.add_object(dictionary! { "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica" });
-            // One column: vertical runs of CJK and horizontal numbers, top to bottom.
-            let column = |x: f64, parts: &[(&str, bool)]| {
-                let mut out = String::new();
-                let mut y = 250.0;
-                for (text, across) in parts {
-                    if *across {
-                        let width = 4.45 * text.len() as f64;
-                        out += &format!("BT /F1 8 Tf 1 0 0 1 {} {} Tm ({text}) Tj ET ", x - width / 2.0, y - 9.0);
-                        y -= 12.0;
-                    } else {
-                        let codes: String = text.chars().map(|c| format!("{:04X}", cid(c))).collect();
-                        out += &format!("BT /CV 12 Tf 1 0 0 1 {x} {y} Tm <{codes}> Tj ET ");
-                        y -= 12.0 * text.chars().count() as f64;
-                    }
-                }
-                out
-            };
-            let mut body = String::new();
-            if heading {
-                body += "BT /F1 14 Tf 1 0 0 1 150 280 Tm (Report 2026) Tj ET ";
-            }
-            body += &column(250.0, &[("2026", true), ("年", false), ("10", true), ("月", false), ("21", true), ("日出版", false)]);
-            body += &column(220.0, &[("第", false), ("12", true), ("頁共有三段", false)]);
             let content = doc.add_object(Stream::new(dictionary! {}, body.into_bytes()));
             let pages = doc.new_object_id();
             let page = doc.add_object(dictionary! {
@@ -2567,6 +2575,36 @@ mod tests {
             extract_page(&pdf, 0, &InterpreterSettings::default()).unwrap()
         };
 
+        // One column: vertical runs of CJK and horizontal numbers, top to bottom. `pitch`: extra
+        // space left after each part, for a column with a hole in it.
+        let column = |x: f64, parts: &[(&str, bool)], extra: f64| {
+            let cjk: Vec<char> = "年月日出版第頁共有三段".chars().collect();
+            let code = |ch: char| cjk.iter().position(|c| *c == ch).unwrap_or(0) + 1;
+            let mut out = String::new();
+            let mut y = 250.0;
+            for (text, across) in parts {
+                if *across {
+                    let width = 4.45 * text.len() as f64;
+                    out += &format!("BT /F1 8 Tf 1 0 0 1 {} {} Tm ({text}) Tj ET ", x - width / 2.0, y - 9.0);
+                    y -= 12.0 + extra;
+                } else {
+                    let codes: String = text.chars().map(|c| format!("{:04X}", code(c))).collect();
+                    out += &format!("BT /CV 12 Tf 1 0 0 1 {x} {y} Tm <{codes}> Tj ET ");
+                    y -= 12.0 * text.chars().count() as f64 + extra;
+                }
+            }
+            out
+        };
+        let page = |heading: bool| {
+            let mut body = String::new();
+            if heading {
+                body += "BT /F1 14 Tf 1 0 0 1 150 280 Tm (Report 2026) Tj ET ";
+            }
+            body += &column(250.0, &[("2026", true), ("年", false), ("10", true), ("月", false), ("21", true), ("日出版", false)], 0.0);
+            body += &column(220.0, &[("第", false), ("12", true), ("頁共有三段", false)], 0.0);
+            render(body)
+        };
+
         let text = page(false);
         assert_eq!(text.plain_text(), "2026年10月21日出版\n第12頁共有三段");
         // A number is part of its column, so a search across the join matches and highlights once.
@@ -2579,6 +2617,12 @@ mod tests {
         // A horizontal line above the columns stays a line of its own: it is longer than a number
         // set across, so its last letters do not join the column below it.
         assert_eq!(page(true).plain_text(), "Report 2026\n2026年10月21日出版\n第12頁共有三段");
+
+        // A number centred on a column but far from every one of its characters -- in a hole in the
+        // column rather than beside a character -- is not part of it (#3812 review). Here the
+        // column's characters are 48 pt apart and the number sits in the middle of that hole.
+        let holed = render(column(250.0, &[("年", false), ("12", true), ("月", false)], 48.0));
+        assert_eq!(holed.plain_text(), "年\n月\n12", "a number in a hole is not in the column: {:?}", holed.plain_text());
     }
 
     /// #1062: the word gap stays between the runs when the right-hand run is drawn first, and
