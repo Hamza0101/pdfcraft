@@ -954,8 +954,16 @@ fn across_in_columns(glyphs: &[Drawn], across: &[usize], down: &[usize], w: f32)
         // whole slot leaves no gap at either end, which the layout would otherwise read as a word
         // gap and write out as a space.
         let cw = (col[2] - col[0]).max(0.1);
-        let slot0 = boxes.iter().filter(|b| b[3] <= run_box[1] + rh * 0.5).map(|b| b[3]).fold(run_box[1] - cw * 0.2, f32::max);
-        let slot1 = boxes.iter().filter(|b| b[1] >= run_box[3] - rh * 0.5).map(|b| b[1]).fold(run_box[3] + cw * 0.2, f32::min);
+        // The characters either side of the number, if it has them: a number can sit at the start
+        // or the end of a column, and one set high or low in its cell overlaps the character it is
+        // beside, so the nearest character each way is taken rather than the nearest clear of it.
+        // The fallbacks are for a number with nothing that way, and must not take part in the
+        // comparison -- seeding `min` with the run's own edge made it beat a real character below,
+        // which left a gap for the layout to read as a word space (#3812 report).
+        let above = boxes.iter().filter(|b| b[1] <= run_box[1]).map(|b| b[3]).fold(f32::NEG_INFINITY, f32::max);
+        let below = boxes.iter().filter(|b| b[3] >= run_box[3]).map(|b| b[1]).fold(f32::INFINITY, f32::min);
+        let slot0 = if above.is_finite() { above } else { run_box[1] - cw * 0.2 };
+        let slot1 = if below.is_finite() { below } else { run_box[3] + cw * 0.2 };
         let step = ((slot1 - slot0) / run.len() as f32).max(0.1);
         let (y0, y1) = (w - col[2], w - col[0]);
         let mut ordered: Vec<usize> = run.to_vec();
@@ -1004,15 +1012,73 @@ fn stacked_down(glyphs: &[Drawn], ids: &[usize]) -> Vec<bool> {
         (centre(g) - centre(p)).abs() <= w * 0.3 && gap > -h * 0.3 && gap <= h * 0.12 && cjk(a) && cjk(b)
     };
     // Maximal runs in content order; `ids` is ascending, so neighbours here were drawn in turn.
+    let mut runs: Vec<(usize, usize)> = Vec::new();
     let mut start = 0;
     for end in 1..=ids.len() {
         if end < ids.len() && follows(end - 1, end) {
             continue;
         }
+        runs.push((start, end));
         if end - start >= MIN_STACK {
             stacked[start..end].fill(true);
         }
         start = end;
+    }
+
+    // A paragraph's last column often holds a character or two, which is under the length a stack
+    // needs to be read as a column on its own. Such a run is read as a column when one that *was*
+    // detected lines up with it: its characters are the same size, its top is the column's top,
+    // and it stands beside the column with nothing of its own line next to it. Nothing fires here
+    // unless the page already has a column, which is what keeps a one-character line or a table
+    // cell out of it (#3812 report).
+    let found: Vec<[f32; 4]> = runs
+        .iter()
+        .filter(|(a, b)| b - a >= MIN_STACK)
+        .filter_map(|(a, b)| {
+            let mut bb = box_of(*a)?;
+            for k in *a..*b {
+                if let Some(r) = box_of(k) {
+                    union(&mut bb, &r);
+                }
+            }
+            Some(bb)
+        })
+        .collect();
+    if !found.is_empty() {
+        // A glyph of the same line beside this one: then it is a line, not a column. A glyph that
+        // is itself part of a column does not count -- the next column's top character sits beside
+        // a short column exactly as a line's neighbour would.
+        let beside = |k: usize, known: &[bool]| {
+            let Some(r) = box_of(k) else { return false };
+            let (rh, rw) = ((r[3] - r[1]).max(0.1), (r[2] - r[0]).max(0.1));
+            (0..ids.len()).any(|o| {
+                o != k
+                    && !known.get(o).copied().unwrap_or(false)
+                    && box_of(o).is_some_and(|b| {
+                        let apart = (b[0] - r[2]).max(r[0] - b[2]);
+                        (b[1] - r[1]).abs() <= rh * 0.3 && apart > -rw * 0.3 && apart <= rw * 1.5
+                    })
+            })
+        };
+        for (a, b) in runs.iter().copied().filter(|(a, b)| b - a < MIN_STACK) {
+            let Some(mut bb) = box_of(a) else { continue };
+            for k in a..b {
+                if let Some(r) = box_of(k) {
+                    union(&mut bb, &r);
+                }
+            }
+            let (bw, bh) = ((bb[2] - bb[0]).max(0.1), (bb[3] - bb[1]).max(0.1));
+            let centre = (bb[0] + bb[2]) / 2.0;
+            let lines_up = found.iter().any(|c| {
+                let cw = (c[2] - c[0]).max(0.1);
+                let apart = ((c[0] + c[2]) / 2.0 - centre).abs();
+                (bb[1] - c[1]).abs() <= cw * 0.4 && (bw - cw).abs() <= cw * 0.2 && apart > cw * 0.6 && apart <= cw * 5.0
+            });
+            let columns_so_far = stacked.clone();
+            if lines_up && (a..b).all(&cjk) && !(a..b).any(|k| beside(k, &columns_so_far)) && bh <= bw * 2.2 * (b - a) as f32 {
+                stacked[a..b].fill(true);
+            }
+        }
     }
     stacked
 }
@@ -2503,6 +2569,24 @@ mod tests {
         let all = text.glyphs_in([0.0, 0.0, 300.0, 300.0]);
         assert_eq!(text.column_text(&all), columns.join("\n"));
 
+        // A paragraph's last column often holds one or two characters, which is under the length a
+        // stack needs on its own. Such a column is read as one when a detected column lines up
+        // with it, so it keeps its place rather than coming out before the rest (#3812 report).
+        let mixed = |cols: &[&str]| {
+            let mut body = String::from("BT /CH 12 Tf ");
+            for (i, col) in cols.iter().enumerate() {
+                for (j, ch) in col.chars().enumerate() {
+                    let (x, y) = (250.0 - 18.0 * i as f64, 250.0 - 12.0 * j as f64);
+                    body += &format!("1 0 0 1 {x} {y} Tm <{:04X}> Tj ", cid(ch));
+                }
+            }
+            body += "ET";
+            render(body).plain_text()
+        };
+        assert_eq!(mixed(&["春天來得很早，山", "上。"]), "春天來得很早，山\n上。");
+        assert_eq!(mixed(&["春天來得很早，山上", "。"]), "春天來得很早，山上\n。");
+        assert_eq!(mixed(&["春天來得很早，", "山。", "遊客慢慢上山。"]), "春天來得很早，\n山。\n遊客慢慢上山。");
+
         // Centred one-character lines are lines, not a column: they step down by more than their
         // own height, so there is a gap between them where a column has none. They keep their
         // horizontal writing direction, and a word beside the first of them reads with it (#3812
@@ -2617,6 +2701,17 @@ mod tests {
         // A horizontal line above the columns stays a line of its own: it is longer than a number
         // set across, so its last letters do not join the column below it.
         assert_eq!(page(true).plain_text(), "Report 2026\n2026年10月21日出版\n第12頁共有三段");
+
+        // A number set high or low in its cell overlaps the character beside it, so the hole it is
+        // given has to reach that character and not stop at the number's own edge: it stopped
+        // short, and the layout read what was left as a word space -- 「第12 頁共有三段」 (#3812
+        // report).
+        let high = render(
+            "BT /CV 12 Tf 1 0 0 1 220 250 Tm <0006> Tj ET BT /F1 9 Tf 1 0 0 1 215 232 Tm (12) Tj ET \
+             BT /CV 12 Tf 1 0 0 1 220 226 Tm <000700080009000A000B> Tj ET"
+                .to_string(),
+        );
+        assert_eq!(high.plain_text(), "第12頁共有三段");
 
         // A number centred on a column but far from every one of its characters -- in a hole in the
         // column rather than beside a character -- is not part of it (#3812 review). Here the
