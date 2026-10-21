@@ -757,6 +757,25 @@ pub(crate) fn extract_page_filtered(pdf: &Pdf, page: usize, settings: &Interpret
             }
         }
     }
+    // A number set across a vertical column (縱中橫) is horizontal glyphs among vertical ones: it
+    // joins the column at its own height, with a box of its own in the column's frame (#3711).
+    let mut placed: Vec<(usize, [f32; 4])> = Vec::new();
+    if let (Some(across), Some(down)) = (quarters.first().cloned(), quarters.get(1).cloned())
+        && !across.is_empty()
+        && !down.is_empty()
+    {
+        placed = across_in_columns(&glyphs, &across, &down, w);
+        if !placed.is_empty() {
+            let joined: Vec<usize> = placed.iter().map(|(i, _)| *i).collect();
+            if let Some(q) = quarters.get_mut(0) {
+                q.retain(|i| !joined.contains(i));
+            }
+            if let Some(q) = quarters.get_mut(1) {
+                q.extend(joined);
+                q.sort_unstable();
+            }
+        }
+    }
     // A horizontal heading must not force a vertical body back into horizontal line grouping.
     // Group each writing direction independently, then join flows from their topmost position.
     let upright = |quarters: [Vec<usize>; 4]| {
@@ -765,7 +784,13 @@ pub(crate) fn extract_page_filtered(pdf: &Pdf, page: usize, settings: &Interpret
             .enumerate()
             .filter(|(_, ids)| !ids.is_empty())
             .map(|(quarter, ids)| {
-                let rects = ids.iter().map(|&i| to_upright(glyphs[i].2.rect, quarter as u8, w, h)).collect();
+                let rects = ids
+                    .iter()
+                    .map(|&i| match placed.iter().find(|(k, _)| *k == i) {
+                        Some((_, r)) => *r,
+                        None => to_upright(glyphs[i].2.rect, quarter as u8, w, h),
+                    })
+                    .collect();
                 arrange_flow(&glyphs, ids, rects, Some(quarter as u8))
             })
             .collect();
@@ -849,6 +874,100 @@ struct Flow {
 }
 
 /// Lay out the page's glyphs `ids`, giving each the box at the same position in `rects`.
+/// The most glyphs a horizontal run may have to count as a number set across a vertical column.
+/// 縱中橫 is used for two to four digits (a year, a page number); a longer run beside a column is
+/// text of its own.
+const MAX_ACROSS: usize = 4;
+
+/// Horizontal runs that sit inside a vertical column, with where each glyph goes in the column's
+/// frame. A number in vertical CJK is often set across the column -- 縱中橫 (tate-chu-yoko), as in
+/// 「2026年10月21日」 -- and such a run is horizontal glyphs among vertical ones. Split by writing
+/// direction, it became a flow of its own, written out before or after all the vertical text: a
+/// drag down the column missed it, and a drag that began on it selected another part of the page
+/// (#3711).
+///
+/// The run joins the column at its own height, its glyphs in the order they are drawn across. The
+/// boxes answered here are in the frame the column is laid out in ([`to_upright`] with quarter 1),
+/// which is why they are computed rather than rotated: the glyphs of the run share one height, so
+/// rotating them would stack them on top of each other instead of placing them along the column.
+fn across_in_columns(glyphs: &[Drawn], across: &[usize], down: &[usize], w: f32) -> Vec<(usize, [f32; 4])> {
+    // The columns: vertical glyphs grouped by centre, each keeping its glyphs' boxes so the hole a
+    // number sits in can be measured.
+    let mut columns: Vec<([f32; 4], Vec<[f32; 4]>)> = Vec::new();
+    for &i in down {
+        let Some(g) = glyphs.get(i) else { continue };
+        let r = g.2.rect;
+        let centre = (r[0] + r[2]) / 2.0;
+        let gw = (r[2] - r[0]).max(0.1);
+        match columns.iter_mut().find(|(c, _)| ((c[0] + c[2]) / 2.0 - centre).abs() <= gw * 0.6) {
+            Some((c, boxes)) => {
+                union(c, &r);
+                boxes.push(r);
+            }
+            None => columns.push((r, vec![r])),
+        }
+    }
+    let mut out = Vec::new();
+    // Runs of horizontal glyphs that read on together: drawn in turn, on one line, touching. A run
+    // is cut where the line or the place changes, not after a fixed number of glyphs, or a heading
+    // beside a column would give up its last letters to the number below it.
+    let reads_on = |a: usize, b: usize| {
+        let (Some(p), Some(g)) = (glyphs.get(a).map(|g| g.2.rect), glyphs.get(b).map(|g| g.2.rect)) else { return false };
+        let hh = (p[3] - p[1]).max(g[3] - g[1]).max(0.1);
+        (g[1] - p[1]).abs() <= hh * 0.3 && g[0] >= p[0] && g[0] - p[2] <= hh * 0.6
+    };
+    let mut start = 0;
+    while start < across.len() {
+        let mut end = start + 1;
+        while end < across.len() && across[end] == across[end - 1] + 1 && reads_on(across[end - 1], across[end]) {
+            end += 1;
+        }
+        let run = &across[start..end];
+        start = end;
+        // A number set across a column is a few glyphs; a longer run is text of its own.
+        if run.len() > MAX_ACROSS {
+            continue;
+        }
+        let mut run_box = [f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY];
+        for &i in run {
+            if let Some(g) = glyphs.get(i) {
+                union(&mut run_box, &g.2.rect);
+            }
+        }
+        let (rw, rh) = (run_box[2] - run_box[0], run_box[3] - run_box[1]);
+        let centre = (run_box[0] + run_box[2]) / 2.0;
+        // On the column's centre, no wider than two of its characters and no taller than one, and
+        // at or next to the column's own span. A number set across is centred on the column and is
+        // often *not* squeezed into its width, so its box need not be inside the column's; a
+        // horizontal heading above a column is wider than this and has more glyphs than
+        // `MAX_ACROSS`, so it stays a flow of its own.
+        let Some((col, boxes)) = columns.iter().find(|(c, _)| {
+            let cw = (c[2] - c[0]).max(0.1);
+            ((c[0] + c[2]) / 2.0 - centre).abs() <= cw * 0.5 && rw <= cw * 2.5 && rh <= cw * 1.4 && run_box[3] >= c[1] - cw && run_box[1] <= c[3] + cw
+        }) else {
+            continue;
+        };
+        // The hole between the column's characters above and below the number: giving the run that
+        // whole slot leaves no gap at either end, which the layout would otherwise read as a word
+        // gap and write out as a space.
+        let cw = (col[2] - col[0]).max(0.1);
+        let slot0 = boxes.iter().filter(|b| b[3] <= run_box[1] + rh * 0.5).map(|b| b[3]).fold(run_box[1] - cw * 0.2, f32::max);
+        let slot1 = boxes.iter().filter(|b| b[1] >= run_box[3] - rh * 0.5).map(|b| b[1]).fold(run_box[3] + cw * 0.2, f32::min);
+        let step = ((slot1 - slot0) / run.len() as f32).max(0.1);
+        let (y0, y1) = (w - col[2], w - col[0]);
+        let mut ordered: Vec<usize> = run.to_vec();
+        ordered.sort_by(|a, b| {
+            let x = |i: usize| glyphs.get(i).map_or(0.0, |g| g.2.rect[0]);
+            x(*a).total_cmp(&x(*b))
+        });
+        for (k, i) in ordered.into_iter().enumerate() {
+            let x0 = slot0 + step * k as f32;
+            out.push((i, [x0, y0, x0 + step, y1]));
+        }
+    }
+    out
+}
+
 /// At least this many glyphs stacked down a column before the stack is read as vertical text. Two
 /// below each other happen in horizontal text (a one-character line above another); three in a row,
 /// each touching the one above and on the same centre, do not.
@@ -2368,6 +2487,98 @@ mod tests {
         let text = page(18.0, false);
         let all = text.glyphs_in([0.0, 0.0, 300.0, 300.0]);
         assert_eq!(text.column_text(&all), columns.join("\n"));
+    }
+
+    /// #3711: a number set across a vertical column (縱中橫, tate-chu-yoko), as in
+    /// 「2026年10月21日」. The digits are horizontal glyphs among vertical ones, so the split by
+    /// writing direction made them a flow of their own, written out before or after all the
+    /// vertical text: a drag down the column missed them, and one that began on them selected
+    /// another part of the page.
+    #[test]
+    fn a_number_set_across_a_vertical_column_stays_in_it() {
+        use lopdf::{Document, Object, Stream, dictionary};
+
+        // Two columns, read right to left, each with numbers set across: the right one starts with
+        // a number (so it is not between two of the column's characters) and the left has one in
+        // the middle. `heading`: a horizontal line above them, which must stay a line of its own.
+        let page = |heading: bool| {
+            let chars: Vec<char> = "年月日出版第頁共有三段".chars().collect();
+            let cid = |ch: char| chars.iter().position(|c| *c == ch).unwrap_or(0) + 1;
+            let mut doc = Document::with_version("1.7");
+            let bfchar: String = chars
+                .iter()
+                .map(|ch| {
+                    let utf16: Vec<String> = ch.to_string().encode_utf16().map(|u| format!("{u:04X}")).collect();
+                    format!("<{:04X}> <{}>", cid(*ch), utf16.concat())
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            let cmap = format!(
+                "/CIDInit /ProcSet findresource begin 12 dict begin begincmap /CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def /CMapName /TestTcy def /CMapType 2 def 1 begincodespacerange <0000> <FFFF> endcodespacerange {} beginbfchar {bfchar} endbfchar endcmap CMapName currentdict /CMap defineresource pop end end",
+                chars.len()
+            );
+            let to_unicode = doc.add_object(Stream::new(dictionary! {}, cmap.into_bytes()));
+            let descendant = doc.add_object(dictionary! {
+                "Type" => "Font", "Subtype" => "CIDFontType2", "BaseFont" => "TestTcy", "DW" => 1000, "CIDToGIDMap" => "Identity",
+                "DW2" => vec![Object::Integer(880), Object::Integer(-1000)],
+                "CIDSystemInfo" => dictionary! { "Registry" => Object::string_literal("Adobe"), "Ordering" => Object::string_literal("Identity"), "Supplement" => 0 },
+            });
+            let vertical = doc.add_object(dictionary! {
+                "Type" => "Font", "Subtype" => "Type0", "BaseFont" => "TestTcy", "Encoding" => "Identity-V",
+                "DescendantFonts" => vec![Object::Reference(descendant)], "ToUnicode" => to_unicode,
+            });
+            let latin = doc.add_object(dictionary! { "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica" });
+            // One column: vertical runs of CJK and horizontal numbers, top to bottom.
+            let column = |x: f64, parts: &[(&str, bool)]| {
+                let mut out = String::new();
+                let mut y = 250.0;
+                for (text, across) in parts {
+                    if *across {
+                        let width = 4.45 * text.len() as f64;
+                        out += &format!("BT /F1 8 Tf 1 0 0 1 {} {} Tm ({text}) Tj ET ", x - width / 2.0, y - 9.0);
+                        y -= 12.0;
+                    } else {
+                        let codes: String = text.chars().map(|c| format!("{:04X}", cid(c))).collect();
+                        out += &format!("BT /CV 12 Tf 1 0 0 1 {x} {y} Tm <{codes}> Tj ET ");
+                        y -= 12.0 * text.chars().count() as f64;
+                    }
+                }
+                out
+            };
+            let mut body = String::new();
+            if heading {
+                body += "BT /F1 14 Tf 1 0 0 1 150 280 Tm (Report 2026) Tj ET ";
+            }
+            body += &column(250.0, &[("2026", true), ("年", false), ("10", true), ("月", false), ("21", true), ("日出版", false)]);
+            body += &column(220.0, &[("第", false), ("12", true), ("頁共有三段", false)]);
+            let content = doc.add_object(Stream::new(dictionary! {}, body.into_bytes()));
+            let pages = doc.new_object_id();
+            let page = doc.add_object(dictionary! {
+                "Type" => "Page", "Parent" => pages, "Contents" => content,
+                "MediaBox" => vec![Object::Integer(0), Object::Integer(0), Object::Integer(300), Object::Integer(300)],
+                "Resources" => dictionary! {"Font" => dictionary! {"CV" => vertical, "F1" => latin}},
+            });
+            doc.objects.insert(pages, dictionary! {"Type" => "Pages", "Kids" => vec![Object::Reference(page)], "Count" => 1}.into());
+            let catalog = doc.add_object(dictionary! {"Type" => "Catalog", "Pages" => pages});
+            doc.trailer.set("Root", catalog);
+            let mut bytes = Vec::new();
+            doc.save_to(&mut bytes).unwrap();
+            let pdf = Pdf::new(std::sync::Arc::new(bytes)).unwrap();
+            extract_page(&pdf, 0, &InterpreterSettings::default()).unwrap()
+        };
+
+        let text = page(false);
+        assert_eq!(text.plain_text(), "2026年10月21日出版\n第12頁共有三段");
+        // A number is part of its column, so a search across the join matches and highlights once.
+        assert_eq!(text.find("年10月"), vec![4..8]);
+        assert_eq!(text.line_rects(4..8).len(), 1, "one highlight down the column");
+        // And a drag over the whole page copies the columns as lines, right to left.
+        let all = text.glyphs_in([0.0, 0.0, 300.0, 300.0]);
+        assert_eq!(text.column_text(&all), "2026年10月21日出版\n第12頁共有三段");
+
+        // A horizontal line above the columns stays a line of its own: it is longer than a number
+        // set across, so its last letters do not join the column below it.
+        assert_eq!(page(true).plain_text(), "Report 2026\n2026年10月21日出版\n第12頁共有三段");
     }
 
     /// #1062: the word gap stays between the runs when the right-hand run is drawn first, and
