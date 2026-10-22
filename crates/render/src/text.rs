@@ -759,19 +759,20 @@ pub(crate) fn extract_page_filtered(pdf: &Pdf, page: usize, settings: &Interpret
     }
     // A number set across a vertical column (縱中橫) is horizontal glyphs among vertical ones: it
     // joins the column at its own height, with a box of its own in the column's frame (#3711).
-    let mut placed: Vec<(usize, [f32; 4])> = Vec::new();
+    // Looked up per glyph while the flows are built, so a map rather than a list: a page can hold
+    // as many of these runs as it has columns (#3812 review).
+    let mut placed: std::collections::HashMap<usize, [f32; 4]> = std::collections::HashMap::new();
     if let (Some(across), Some(down)) = (quarters.first().cloned(), quarters.get(1).cloned())
         && !across.is_empty()
         && !down.is_empty()
     {
-        placed = across_in_columns(&glyphs, &across, &down, w);
+        placed = across_in_columns(&glyphs, &across, &down, w).into_iter().collect();
         if !placed.is_empty() {
-            let joined: Vec<usize> = placed.iter().map(|(i, _)| *i).collect();
             if let Some(q) = quarters.get_mut(0) {
-                q.retain(|i| !joined.contains(i));
+                q.retain(|i| !placed.contains_key(i));
             }
             if let Some(q) = quarters.get_mut(1) {
-                q.extend(joined);
+                q.extend(placed.keys().copied());
                 q.sort_unstable();
             }
         }
@@ -786,8 +787,8 @@ pub(crate) fn extract_page_filtered(pdf: &Pdf, page: usize, settings: &Interpret
             .map(|(quarter, ids)| {
                 let rects = ids
                     .iter()
-                    .map(|&i| match placed.iter().find(|(k, _)| *k == i) {
-                        Some((_, r)) => *r,
+                    .map(|&i| match placed.get(&i) {
+                        Some(r) => *r,
                         None => to_upright(glyphs[i].2.rect, quarter as u8, w, h),
                     })
                     .collect();
