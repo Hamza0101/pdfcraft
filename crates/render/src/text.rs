@@ -917,10 +917,26 @@ fn stacked_down(glyphs: &[Drawn], ids: &[usize]) -> Vec<bool> {
         // A glyph of the same line beside this one: then it is a line, not a column. A glyph that
         // is itself part of a column does not count -- the next column's top character sits beside
         // a short column exactly as a line's neighbour would.
+        // Only a glyph at nearly the same height can be beside this one, so the search looks in
+        // bands of one glyph height instead of at the whole page: scanning every glyph for every
+        // glyph of every short run is quadratic, and a scanned book's text layer can hold tens of
+        // thousands of glyphs (#3812 review).
+        let band = |y: f32, h: f32| (y / h.max(0.1)).floor() as i64;
+        let height = |k: usize| box_of(k).map_or(10.0, |r| (r[3] - r[1]).max(0.1));
+        let unit = (0..ids.len()).map(height).fold(f32::INFINITY, f32::min).max(0.1);
+        let mut bands: std::collections::HashMap<i64, Vec<usize>> = std::collections::HashMap::new();
+        for k in 0..ids.len() {
+            if let Some(r) = box_of(k) {
+                for t in band(r[1], unit)..=band(r[3], unit) {
+                    bands.entry(t).or_default().push(k);
+                }
+            }
+        }
         let beside = |k: usize, known: &[bool]| {
             let Some(r) = box_of(k) else { return false };
             let (rh, rw) = ((r[3] - r[1]).max(0.1), (r[2] - r[0]).max(0.1));
-            (0..ids.len()).any(|o| {
+            // One band either side as well: a neighbour may sit up to 0.3 of a height away.
+            (band(r[1], unit) - 1..=band(r[3], unit) + 1).flat_map(|t| bands.get(&t).map(Vec::as_slice).unwrap_or(&[])).any(|&o| {
                 o != k
                     && !known.get(o).copied().unwrap_or(false)
                     && box_of(o).is_some_and(|b| {
@@ -929,6 +945,14 @@ fn stacked_down(glyphs: &[Drawn], ids: &[usize]) -> Vec<bool> {
                     })
             })
         };
+        // The columns by the band their top falls in, for the same reason.
+        let mut tops: std::collections::HashMap<i64, Vec<[f32; 4]>> = std::collections::HashMap::new();
+        for c in &found {
+            tops.entry(band(c[1], unit)).or_default().push(*c);
+        }
+        // The columns the long runs found: a short run accepted here does not make the next one's
+        // neighbour disappear, and taking the snapshot once keeps this out of the inner loop.
+        let columns_so_far = stacked.clone();
         for (a, b) in runs.iter().copied().filter(|(a, b)| b - a < MIN_STACK) {
             let Some(mut bb) = box_of(a) else { continue };
             for k in a..b {
@@ -938,12 +962,13 @@ fn stacked_down(glyphs: &[Drawn], ids: &[usize]) -> Vec<bool> {
             }
             let (bw, bh) = ((bb[2] - bb[0]).max(0.1), (bb[3] - bb[1]).max(0.1));
             let centre = (bb[0] + bb[2]) / 2.0;
-            let lines_up = found.iter().any(|c| {
+            // A column can only line up with a run at nearly its own top, so the columns are
+            // looked up by top in bands of one glyph height as well.
+            let lines_up = (band(bb[1], unit) - 1..=band(bb[1], unit) + 1).flat_map(|t| tops.get(&t).map(Vec::as_slice).unwrap_or(&[])).any(|c| {
                 let cw = (c[2] - c[0]).max(0.1);
                 let apart = ((c[0] + c[2]) / 2.0 - centre).abs();
                 (bb[1] - c[1]).abs() <= cw * 0.4 && (bw - cw).abs() <= cw * 0.2 && apart > cw * 0.6 && apart <= cw * 5.0
             });
-            let columns_so_far = stacked.clone();
             if lines_up && (a..b).all(&cjk) && !(a..b).any(|k| beside(k, &columns_so_far)) && bh <= bw * 2.2 * (b - a) as f32 {
                 stacked[a..b].fill(true);
             }
