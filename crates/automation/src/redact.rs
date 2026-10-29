@@ -107,12 +107,25 @@ impl Automation {
             matched_words = needles.iter().map(|w| (w.clone(), 0)).collect();
             // A layer that is off hides its content from the renderer, and so from Find. For
             // redaction the promise is every match on every page, and a match left behind stays
-            // in the saved file, so the search reads the text with every layer visible (#3646).
-            // Documents without a hidden layer take the cached path, which Find shares.
+            // in the saved file, so the search also reads the text with every layer visible
+            // (#3646). Documents without a hidden layer take the cached path, which Find shares.
+            //
+            // Both passes, because all-ON is not a superset of every visibility state: an
+            // `/OCMD` with `/P /AnyOff` is visible exactly when one of its groups is off, so
+            // forcing them all on hides it. Searching only all-ON marked the other matches and
+            // left that one in the saved file -- the same leak by a different route (noted in
+            // review). The document's own states find it; all-ON finds what a hidden layer
+            // holds; the marks are the union.
             let any_hidden = self.doc(a)?.info.layers.iter().any(|l| !l.visible);
-            let texts = if any_hidden { self.page_texts_every_layer(id, &pages)? } else { self.page_texts(id, &pages)? };
+            let mut passes = vec![self.page_texts(id, &pages)?];
+            if any_hidden {
+                passes.push(self.page_texts_every_layer(id, &pages)?);
+            }
             let info = self.doc(a)?.info.clone();
-            for (&p, text) in pages.iter().zip(&texts) {
+            // The same text found by both passes is one mark. Quads come from the same
+            // extraction of the same glyphs, so a match found twice has identical ones.
+            let mut seen: std::collections::HashSet<(usize, Vec<[u64; 8]>)> = std::collections::HashSet::new();
+            for (&p, text) in passes.iter().flat_map(|texts| pages.iter().zip(texts)) {
                 let hits: Vec<(Option<usize>, _)> = match pattern {
                     Some(pat) => text.find_with(|chars| find_pattern(pat, chars)).into_iter().map(|h| (None, h)).collect(),
                     None => needles
@@ -123,7 +136,7 @@ impl Automation {
                 };
                 for (word, h) in hits {
                     let quads: Vec<[f64; 8]> = text.line_rects(h).into_iter().map(|r| info.pages[p].view_rect_to_quad(r)).collect();
-                    if !quads.is_empty() {
+                    if !quads.is_empty() && seen.insert((p, quads.iter().map(|q| q.map(f64::to_bits)).collect())) {
                         marks.push((p, quads));
                         if let Some(m) = word.and_then(|i| matched_words.get_mut(i)) {
                             m.1 += 1;
