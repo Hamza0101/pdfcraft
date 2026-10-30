@@ -116,10 +116,18 @@ impl Automation {
             // left that one in the saved file -- the same leak by a different route (noted in
             // review). The document's own states find it; all-ON finds what a hidden layer
             // holds; the marks are the union.
-            let any_hidden = self.doc(a)?.info.layers.iter().any(|l| !l.visible);
+            let layers = &self.doc(a)?.info.layers;
+            let (has_layers, any_hidden) = (!layers.is_empty(), layers.iter().any(|l| !l.visible));
             let mut passes = vec![self.page_texts(id, &pages)?];
             if any_hidden {
                 passes.push(self.page_texts_every_layer(id, &pages)?);
+            }
+            // And all off, for the `/P /AllOff` an `/OCMD` can carry: that is visible only when
+            // every group it lists is off, so a document with some on hides it from the all-on
+            // pass and from its own states alike (noted in review). The four `/OCMD` policies and
+            // a plain `/OC` are then all covered by one of the three passes.
+            if has_layers {
+                passes.push(self.page_texts_all_layers_off(id, &pages)?);
             }
             let info = self.doc(a)?.info.clone();
             // The same text found by both passes is one mark. Quads come from the same

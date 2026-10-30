@@ -9254,24 +9254,36 @@ fn redaction_finds_text_on_a_hidden_layer() {
     let public = "BT /F1 18 Tf 40 240 Td (Public summary) Tj ET";
     let secret = "BT /F1 18 Tf 40 140 Td (Account SECRET 4417) Tj ET";
     // Page 1 puts the line on a layer that is off; page 2 is the same line, visible; page 3 puts
-    // it in an /OCMD whose /P /AnyOff makes it visible *because* that layer is off.
-    let streams = [format!("{public} /OC /L1 BDC {secret} EMC"), format!("{public} {secret}"), format!("{public} /OC /L2 BDC {secret} EMC")];
+    // it in an /OCMD whose /P /AnyOff makes it visible *because* that layer is off; page 4 in one
+    // whose /P /AllOff lists that layer and a second one that is on, so it is visible neither in
+    // the document's own states nor with every layer on.
+    let streams = [
+        format!("{public} /OC /L1 BDC {secret} EMC"),
+        format!("{public} {secret}"),
+        format!("{public} /OC /L2 BDC {secret} EMC"),
+        format!("{public} /OC /L4 BDC {public} EMC /OC /L3 BDC {secret} EMC"),
+    ];
     let mut objs: Vec<String> = vec![
-        "<< /Type /Catalog /Pages 2 0 R /OCProperties << /OCGs [4 0 R] /D << /OFF [4 0 R] /Order [4 0 R] >> >> >>".into(),
-        "<< /Type /Pages /Kids [5 0 R 7 0 R 9 0 R] /Count 3 >>".into(),
+        "<< /Type /Catalog /Pages 2 0 R /OCProperties << /OCGs [4 0 R 14 0 R] /D << /OFF [4 0 R] /Order [4 0 R 14 0 R] >> >> >>".into(),
+        "<< /Type /Pages /Kids [5 0 R 7 0 R 9 0 R 11 0 R] /Count 4 >>".into(),
         "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".into(),
         "<< /Type /OCG /Name (Reviewer notes) >>".into(),
     ];
     for (i, c) in streams.iter().enumerate() {
         objs.push(format!(
-            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 300] /Contents {} 0 R /Resources << /Font << /F1 3 0 R >> /Properties << /L1 4 0 R /L2 {} 0 R >> >> >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 300] /Contents {} 0 R /Resources << /Font << /F1 3 0 R >> /Properties << /L1 4 0 R /L2 {} 0 R /L3 {} 0 R /L4 {} 0 R >> >> >>",
             6 + 2 * i,
-            5 + 2 * streams.len()
+            5 + 2 * streams.len(),
+            7 + 2 * streams.len(),
+            6 + 2 * streams.len()
         ));
         objs.push(format!("<< /Length {} >>\nstream\n{c}\nendstream", c.len()));
     }
-    // The /OCMD last, so its object number does not shift the pages.
+    // The /OCMDs and the second layer last, so their numbers do not shift the pages. The second
+    // /OCMD lists the off layer and the on one, so `/AllOff` holds only with every layer off.
     objs.push("<< /Type /OCMD /OCGs [4 0 R] /P /AnyOff >>".into());
+    objs.push("<< /Type /OCG /Name (Print marks) >>".into());
+    objs.push("<< /Type /OCMD /OCGs [4 0 R 14 0 R] /P /AllOff >>".into());
     let mut pdf = b"%PDF-1.7\n".to_vec();
     let mut offsets = Vec::new();
     for (i, o) in objs.iter().enumerate() {
@@ -9288,7 +9300,9 @@ fn redaction_finds_text_on_a_hidden_layer() {
 
     let mut a = auto(&dir);
     let doc = ok(&mut a, "doc_open", json!({ "path": "layers.pdf" }))["doc"].as_u64().unwrap();
-    assert_eq!(ok(&mut a, "doc_info", json!({ "doc": doc }))["layers"][0]["visible"], false, "the layer is off");
+    let info = ok(&mut a, "doc_info", json!({ "doc": doc }));
+    assert_eq!(info["layers"][0]["visible"], false, "one layer is off");
+    assert_eq!(info["layers"][1]["visible"], true, "and one is on, so /AllOff holds in neither existing pass");
 
     // Find still reports what the reader can see: that is a product choice, not this change.
     // Find still reports what the reader can see: that is a product choice, not this change. It
@@ -9297,10 +9311,10 @@ fn redaction_finds_text_on_a_hidden_layer() {
 
     // Redaction marks both, and applying removes the word from the file.
     let marked = ok(&mut a, "redact_mark", json!({ "doc": doc, "find": "SECRET" }));
-    assert_eq!(marked["marked"], 3, "all three copies are marked, once each: {marked}");
-    assert_eq!(marked["pages_marked"], json!([1, 2, 3]), "{marked}");
+    assert_eq!(marked["marked"], 4, "all four copies are marked, once each: {marked}");
+    assert_eq!(marked["pages_marked"], json!([1, 2, 3, 4]), "{marked}");
     assert_eq!(marked["matched_words"], json!(null), "the find form reports no word list");
-    assert_eq!(ok(&mut a, "redact_apply", json!({ "doc": doc }))["applied"], 3);
+    assert_eq!(ok(&mut a, "redact_apply", json!({ "doc": doc }))["applied"], 4);
     ok(&mut a, "doc_save", json!({ "doc": doc, "path": "redacted.pdf" }));
     let saved = std::fs::read(dir.join("redacted.pdf")).unwrap();
     assert!(!saved.windows(6).any(|w| w == b"SECRET"), "the word is gone from the saved bytes");

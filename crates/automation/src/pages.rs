@@ -140,12 +140,26 @@ impl Automation {
     ///
     /// Not cached. The text cache holds what Find sees, and this is deliberately different.
     pub(crate) fn page_texts_every_layer(&mut self, id: DocId, pages: &[usize]) -> Result<Vec<Arc<PageText>>> {
+        self.page_texts_with_layers(id, pages, true)
+    }
+
+    /// Page text with every layer hidden. The companion to [`Self::page_texts_every_layer`]: an
+    /// `/OCMD` with `/P /AllOff` is visible only when all of its groups are off, so a document
+    /// where some are on hides it from both the all-on pass and its own states, and redaction's
+    /// search found it in neither (noted in review of #3646).
+    ///
+    /// Not cached, for the same reason as the all-on pass.
+    pub(crate) fn page_texts_all_layers_off(&mut self, id: DocId, pages: &[usize]) -> Result<Vec<Arc<PageText>>> {
+        self.page_texts_with_layers(id, pages, false)
+    }
+
+    fn page_texts_with_layers(&mut self, id: DocId, pages: &[usize], visible: bool) -> Result<Vec<Arc<PageText>>> {
         let doc = self.session.get(id).ok_or_else(|| failed("no such document"))?;
         let n = doc.info.pages.len();
         if let Some(p) = pages.iter().find(|p| **p >= n) {
             return Err(failed(format!("page {} is out of range", p + 1)));
         }
-        let on: Vec<(i32, i32, bool)> = doc.info.layers.iter().map(|l| (l.id.0 as i32, i32::from(l.id.1), true)).collect();
+        let on: Vec<(i32, i32, bool)> = doc.info.layers.iter().map(|l| (l.id.0 as i32, i32::from(l.id.1), visible)).collect();
         let bytes = doc.bytes.clone();
         let password: Option<Arc<str>> = doc.password.as_deref().map(Arc::from);
         // Keyed by page, then answered in the order the caller asked for: the parallel path
