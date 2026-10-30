@@ -9317,6 +9317,25 @@ fn redaction_finds_text_on_a_hidden_layer() {
     assert_eq!(ok(&mut a, "redact_apply", json!({ "doc": doc }))["applied"], 4);
     ok(&mut a, "doc_save", json!({ "doc": doc, "path": "redacted.pdf" }));
     let saved = std::fs::read(dir.join("redacted.pdf")).unwrap();
+
+    // Decoded, not just the raw bytes: `redact_apply` rewrites a page's content with
+    // `Stream::flate`, so a word left inside a page it *did* rewrite would be compressed and a
+    // search of the file's bytes would pass without seeing it (noted in review). The raw check
+    // stays, because it is the one that catches a page nobody rewrote at all -- which is the
+    // leak this test is about.
     assert!(!saved.windows(6).any(|w| w == b"SECRET"), "the word is gone from the saved bytes");
+    let reopened = pdfcraft_cos::Document::open(std::sync::Arc::new(saved.clone())).expect("the saved file reopens");
+    let streams: Vec<String> = reopened
+        .object_numbers()
+        .into_iter()
+        .filter_map(|n| {
+            let obj = reopened.try_get(n).ok()?;
+            let pdfcraft_cos::Object::Stream(s) = &*obj else { return None };
+            s.decoded().ok().map(|b| String::from_utf8_lossy(&b).into_owned())
+        })
+        .collect();
+    assert!(!streams.is_empty(), "the file has streams to look inside");
+    assert!(streams.iter().any(|s| s.contains("Public summary")), "the text that was kept is there to be found, so the check is not vacuous");
+    assert!(!streams.iter().any(|s| s.contains("SECRET")), "and the word is gone from every decoded stream");
     let _ = std::fs::remove_dir_all(dir);
 }
