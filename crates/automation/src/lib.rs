@@ -59,13 +59,18 @@ pub(crate) fn image_page(a: &Args) -> Result<pdfcraft_engine::ImagePage> {
         None => None,
     };
     let (width, height) = (a.opt_num("pageWidth")?, a.opt_num("pageHeight")?);
-    match (named, width, height) {
-        (Some(_), Some(_), _) | (Some(_), _, Some(_)) => Err(failed("pageSize and pageWidth/pageHeight can't both be given")),
-        (Some((width, height)), None, None) => Ok(pdfcraft_engine::ImagePage::Fixed { width, height }),
-        (None, Some(width), Some(height)) => Ok(pdfcraft_engine::ImagePage::Fixed { width, height }),
-        (None, None, None) => Ok(pdfcraft_engine::ImagePage::Image),
-        (None, _, _) => Err(failed("pageWidth and pageHeight must be given together")),
-    }
+    let page = match (named, width, height) {
+        (Some(_), Some(_), _) | (Some(_), _, Some(_)) => return Err(failed("pageSize and pageWidth/pageHeight can't both be given")),
+        (Some((width, height)), None, None) => pdfcraft_engine::ImagePage::Fixed { width, height },
+        (None, Some(width), Some(height)) => pdfcraft_engine::ImagePage::Fixed { width, height },
+        (None, None, None) => pdfcraft_engine::ImagePage::Image,
+        (None, _, _) => return Err(failed("pageWidth and pageHeight must be given together")),
+    };
+    // Checked here rather than only where images are written: a source with no image in it never
+    // reaches that writer, so a text-only combine succeeded carrying a page size the schema's
+    // `"minimum": 1` had already refused (noted in review). `ImagePage::check` is the one rule.
+    page.check().map_err(|why| ToolError::InvalidArgs(why.to_string()))?;
+    Ok(page)
 }
 use text_cache::TextCache;
 

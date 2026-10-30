@@ -552,6 +552,23 @@ pub fn source_kind(name: &str, bytes: &[u8]) -> Option<SourceKind> {
     (lower.ends_with(".txt") || lower.ends_with(".text")).then_some(SourceKind::Text)
 }
 
+/// A PDF number: three decimals, and more only when three would round a value that is not zero
+/// down to zero.
+///
+/// A tall, narrow image fitted to a small page is a fraction of a point wide -- a 1 x 4000 pixel
+/// image on a 1 x 1 point page fits at 0.00025 x 1 -- and `{:.3}` wrote that as `0.000`, so the
+/// CTM scaled it by nothing and the page drew no image (noted in review). PDF numbers have no
+/// exponent form, so the digits have to be written out.
+fn num(v: f64) -> String {
+    let mut places = 3;
+    let mut out = format!("{v:.places$}");
+    while places < 9 && v != 0.0 && out.parse::<f64>().is_ok_and(|read| read == 0.0) {
+        places += 2;
+        out = format!("{v:.places$}");
+    }
+    out
+}
+
 /// Detect the image format from its bytes; a TIFF may hold several pages, of which the first
 /// `wanted` are read.
 fn embed(name: &str, bytes: &[u8], wanted: usize) -> Result<Vec<Embedded>, CreateError> {
@@ -601,6 +618,24 @@ pub enum ImagePage {
     Fixed { width: f64, height: f64 },
 }
 
+impl ImagePage {
+    /// Refuse a page size no page may have, naming the side that is wrong.
+    ///
+    /// The size was only checked where images are written, so a source with no image in it --
+    /// a text file made into a PDF on its way into a combine -- carried a size that had already
+    /// been refused everywhere else (noted in review). Callers that take a page size check it
+    /// here, so there is one rule rather than one per path.
+    pub fn check(&self) -> Result<(), CreateError> {
+        let Self::Fixed { width, height } = *self else { return Ok(()) };
+        for (name, side) in [("width", width), ("height", height)] {
+            if !(side.is_finite() && (1.0..=MAX_SIDE).contains(&side)) {
+                return Err(CreateError::Invalid(format!("page {name} must be finite and between 1 and {MAX_SIDE} points, not {side}")));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// One page per image, each the size of its image at the image's resolution.
 pub fn from_images(images: &[(String, Vec<u8>)]) -> Result<Document, CreateError> {
     from_images_with_resolution(images, ImageResolution::Embedded)
@@ -620,11 +655,7 @@ pub fn from_images_on_pages(images: &[(String, Vec<u8>)], resolution: ImageResol
     {
         return Err(CreateError::Invalid("image DPI must be finite and between 1 and 1200".into()));
     }
-    if let ImagePage::Fixed { width, height } = page
-        && (!width.is_finite() || !height.is_finite() || !(1.0..=MAX_SIDE).contains(&width) || !(1.0..=MAX_SIDE).contains(&height))
-    {
-        return Err(CreateError::Invalid(format!("page size must be finite and between 1 and {MAX_SIDE} points")));
-    }
+    page.check()?;
     if images.is_empty() {
         return Err(CreateError::Invalid("no images".into()));
     }
@@ -656,7 +687,7 @@ pub fn from_images_on_pages(images: &[(String, Vec<u8>)], resolution: ImageResol
         xobj.set(b"Im0".to_vec(), Object::Ref(xr));
         let mut res = Dict::new();
         res.set(b"XObject".to_vec(), Object::Dict(xobj));
-        let content = format!("q {w:.3} 0 0 {h:.3} {x:.3} {y:.3} cm /Im0 Do Q\n").into_bytes();
+        let content = format!("q {} 0 0 {} {} {} cm /Im0 Do Q\n", num(w), num(h), num(x), num(y)).into_bytes();
         add_page(&mut doc, page_w, page_h, res, Some(content))?;
     }
     if let Some((name, _)) = images.first() {

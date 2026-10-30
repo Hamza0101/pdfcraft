@@ -9285,6 +9285,39 @@ fn images_can_be_created_on_a_paper_size() {
     let both = a.call("doc_create", &json!({ "from": "images", "paths": ["landscape.png"], "pageSize": "a4", "pageWidth": 300, "pageHeight": 300 }));
     assert!(format!("{both:?}").contains("can't both be given"), "{both:?}");
 
+    // A size the schema's `"minimum": 1` refuses is refused here as well. Nothing checked it, and
+    // a source with no image in it never reaches the image writer that would have, so a text-only
+    // combine succeeded carrying a page size it had already been told was invalid (noted in
+    // review).
+    std::fs::write(dir.join("note.txt"), b"A line of text.").unwrap();
+    std::fs::write(dir.join("note2.txt"), b"Another line.").unwrap();
+    for bad in [json!(0), json!(0.5), json!(-10)] {
+        // An image source, which the image writer already refused -- by the same rule now, and
+        // before any file is read rather than part way through.
+        let r = a.call("doc_create", &json!({ "from": "images", "paths": ["landscape.png"], "pageWidth": bad, "pageHeight": 300 }));
+        assert!(format!("{r:?}").contains("page width must be"), "images {bad}: {r:?}");
+        let r = a.call("doc_create", &json!({ "from": "images", "paths": ["landscape.png"], "pageWidth": 300, "pageHeight": bad }));
+        assert!(format!("{r:?}").contains("page height must be"), "images {bad}: {r:?}");
+        // And the paths that take a page size for a source with no image in it: a text file is
+        // made into a PDF first and goes through the same place, so a combine of one used to
+        // succeed carrying a page size the schema had already refused.
+        let r = a.call("doc_combine", &json!({ "paths": ["note.txt", "note2.txt"], "pageWidth": bad, "pageHeight": 300, "out": "bad.pdf" }));
+        assert!(format!("{r:?}").contains("page width must be"), "a text-only combine {bad}: {r:?}");
+        // `mode: separate` reads the page size once, before any file, so it refuses up front
+        // rather than reporting a size error against each image.
+        let r = a.call(
+            "doc_create_multiple",
+            &json!({ "paths": ["note.txt"], "mode": "separate", "out_dir": "bad", "pageHeight": bad, "pageWidth": 300 }),
+        );
+        assert!(format!("{r:?}").contains("page height must be"), "mode separate {bad}: {r:?}");
+    }
+    // The far side of the range is the same rule, so it is refused the same way.
+    let huge = a.call("doc_combine", &json!({ "paths": ["note.txt", "note2.txt"], "pageWidth": 14401, "pageHeight": 300, "out": "huge.pdf" }));
+    assert!(format!("{huge:?}").contains("page width must be"), "{huge:?}");
+    // And the ends of the range are allowed, so the check is a range and not an exclusion.
+    ok(&mut a, "doc_create", json!({ "from": "images", "paths": ["landscape.png"], "pageWidth": 1, "pageHeight": 1 }));
+    ok(&mut a, "doc_combine", json!({ "paths": ["note.txt", "note2.txt"], "pageWidth": 14400, "pageHeight": 14400, "out": "wide.pdf" }));
+
     // Combining images takes it as well.
     ok(&mut a, "doc_combine", json!({ "paths": paths, "pageSize": "letter", "out": "combined.pdf" }));
     let combined = ok(&mut a, "doc_open", json!({ "path": "combined.pdf" }))["doc"].as_u64().unwrap();

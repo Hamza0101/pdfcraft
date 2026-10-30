@@ -122,6 +122,41 @@ fn images_on_a_fixed_page_are_fitted_and_centred() {
     }
 }
 
+/// A tall, narrow image fitted to a small page is a fraction of a point wide. Three decimals
+/// wrote that as `0.000`, so the CTM scaled x by nothing and the page drew no image at all
+/// (noted in review).
+#[test]
+fn an_image_fitted_to_a_fraction_of_a_point_is_still_drawn() {
+    let tall = {
+        let mut out = Vec::new();
+        {
+            let mut enc = png::Encoder::new(&mut out, 1, 4000);
+            enc.set_color(png::ColorType::Rgb);
+            enc.set_depth(png::BitDepth::Eight);
+            let mut w = enc.write_header().unwrap();
+            w.write_image_data(&vec![200u8; 3 * 4000]).unwrap();
+        }
+        out
+    };
+    let images = [("tall.png".into(), tall)];
+    let page = ImagePage::Fixed { width: 1.0, height: 1.0 };
+    let doc = reopen(&from_images_on_pages(&images, ImageResolution::Dpi(72.0), page).unwrap());
+    let drawn = content_of(&doc, 0);
+
+    // 1 x 4000 pt fitted to 1 x 1 pt: 0.00025 wide, which three decimals cannot hold.
+    assert!(drawn.contains("q 0.00025 0 0 1.000"), "the width keeps a value that draws: {drawn}");
+    // Whatever the digits, the scale a reader takes from the CTM has to be nonzero.
+    let scale: f64 = drawn.split_whitespace().nth(1).expect("an x scale").parse().expect("a number");
+    assert!(scale > 0.0, "a zero x scale draws nothing: {drawn}");
+    // And written out in full: a PDF number may not carry an exponent.
+    assert!(!drawn.contains('e') && !drawn.contains('E'), "no exponent form: {drawn}");
+
+    // An ordinary size keeps the three decimals it had, so the usual output does not change.
+    let images = [("photo.png".into(), png_bytes(true))];
+    let doc = reopen(&from_images_on_pages(&images, ImageResolution::Dpi(72.0), ImagePage::Fixed { width: 10.0, height: 10.0 }).unwrap());
+    assert!(content_of(&doc, 0).contains("10.000 0 0 5.000 0.000 2.500 cm"), "{}", content_of(&doc, 0));
+}
+
 #[test]
 fn image_resolution_override_changes_size_without_resampling() {
     let images = [("photo.png".into(), png_bytes(true)), ("scan.jpg".into(), jpeg_bytes())];
