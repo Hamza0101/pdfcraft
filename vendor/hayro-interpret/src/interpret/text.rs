@@ -75,9 +75,22 @@ pub(crate) fn show_glyph<'a>(
     // PdfCraft patch (64): in modes 3 and 7 the text "shall not be rendered" (§9.3.6); `7 Tr`
     // painted the glyphs in the fill colour. It is still reported as clipping text, but in
     // modes 4 to 7 "nothing shall be added to the clipping path" (`clip_glyph`).
-    let render_mode = match (glyph, ctx.get().text_state.render_mode) {
+    let mode_now = ctx.get().text_state.render_mode;
+    let render_mode = match (glyph, mode_now) {
         (Glyph::Type3(_), TextRenderingMode::Invisible) => TextRenderingMode::Invisible,
         (Glyph::Type3(_), TextRenderingMode::Clip) => TextRenderingMode::Clip,
+        // PdfCraft patch (64, extended): modes 4 to 6 render *and* clip. A Type 3 glyph adds
+        // nothing to the clipping path, so the clip this text object builds is unknown -- and
+        // dispatching it as `Fill` means `clip_glyph` never sees it, so nothing marked it. A
+        // space in another font later in the same object would then leave `ET` installing an
+        // empty clip and hiding the rest of the page (noted in review).
+        (
+            Glyph::Type3(_),
+            TextRenderingMode::FillAndClip | TextRenderingMode::StrokeAndClip | TextRenderingMode::FillAndStrokeAndClip,
+        ) => {
+            ctx.get_mut().text_state.clip_unsupported = true;
+            TextRenderingMode::Fill
+        }
         (Glyph::Type3(_), _) => TextRenderingMode::Fill,
         (_, mode) => mode,
     };

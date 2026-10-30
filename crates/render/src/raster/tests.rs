@@ -7036,10 +7036,15 @@ fn test_clip_only_text_raster_preserves_clipping_without_painting() {
     assert!(pixels.contains(&white), "the clip is text-shaped, not the whole page");
 }
 
-/// A text object in a clipping mode clips what follows it even when it drew no glyph: the
-/// clip is empty and nothing paints (ISO 32000-1 §9.3.6). Applying nothing instead left the
-/// fill a clipping title was painted through covering the whole page once its glyphs were
-/// gone, which is what editing or redacting such a title did (#3123, #3429).
+/// A glyph *shown* in a clipping mode clips what follows it even when it has no outline to clip
+/// to: a space clips to nothing, so nothing paints through it (ISO 32000-1 §9.3.6). Applying no
+/// clip instead left a fill that was meant to show through the text covering everything after
+/// it.
+///
+/// A text object that shows no glyph at all is the opposite case and leaves the clipping path
+/// alone, which is the second case below. An earlier version of this change clipped for that one
+/// too and called it the cause of #3123 and #3429; that was wrong, so no issue is claimed here
+/// (see the PR description, and `refuse` in #3447).
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), test)]
 fn a_glyph_shown_in_a_clipping_mode_clips_even_with_no_outline() {
@@ -7077,6 +7082,63 @@ fn a_glyph_shown_in_a_clipping_mode_clips_even_with_no_outline() {
             .count() as u32;
         assert_eq!(red, want_red, "{content}");
     }
+}
+
+/// A Type 3 glyph in modes 4 to 6 renders *and* clips, and it adds nothing to the clipping path,
+/// so the clip is unknown. Dispatching it as `Fill` meant `clip_glyph` never saw it and nothing
+/// marked that: a space in another font later in the same text object then left `ET` installing
+/// an empty clip, and the rest of the page was hidden (noted in review).
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+fn a_type3_glyph_in_a_clip_and_fill_mode_leaves_the_clip_unknown() {
+    // One text object: a Type 3 glyph in `mode Tr`, then a space in Helvetica, which resolves to
+    // an empty outline. Then a red fill over the whole page.
+    let red_of = |mode: u8| {
+        let content = format!("q BT {mode} Tr /F1 20 Tf 10 10 Td (A) Tj /F2 20 Tf ( ) Tj ET 1 0 0 rg 0 0 40 40 re f Q");
+        let glyph = "1 0 0 0 1 1 d1 0.12 0.12 0.71 0.71 re f";
+        let pdf = format!(
+            "%PDF-1.7
+1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj
+2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj
+3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 40 40] /Contents 4 0 R /Resources << /Font << /F1 5 0 R /F2 7 0 R >> >> >> endobj
+4 0 obj << /Length {} >> stream
+{content}
+endstream endobj
+5 0 obj << /Type /Font /Subtype /Type3 /FontBBox [0 0 1 1] /FontMatrix [1 0 0 1 0 0] /FirstChar 65 /LastChar 65 /Widths [1]
+  /Encoding << /Differences [65 /a] >> /CharProcs << /a 6 0 R >> >> endobj
+6 0 obj << /Length {} >> stream
+{glyph}
+endstream endobj
+7 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >> endobj
+trailer << /Root 1 0 R >>
+%%EOF",
+            content.len(),
+            glyph.len()
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut r = PageRenderer::new(Arc::new(pdf.into_bytes()), RenderConfig::default());
+            let _ = tx.send(r.render(RenderRequest { page: 0, kind: RequestKind::Pixels, tile: None, scale: 1.0, tag: 0, preview: false }));
+        });
+        let page = rx.recv_timeout(std::time::Duration::from_secs(60)).expect("the page must render");
+        assert!(page.error.is_none(), "{mode} Tr: {:?}", page.error);
+        (0..page.width * page.height)
+            .filter(|i| {
+                let o = (*i * 4) as usize;
+                page.rgba[o] > 180 && page.rgba[o + 1] < 90
+            })
+            .count() as u32
+    };
+
+    // Modes 4 to 6: the clip is unknown, so the fill after `ET` is left alone. It used to be
+    // clipped away to nothing by the space's empty outline.
+    for mode in [4, 5, 6] {
+        assert_eq!(red_of(mode), 1600, "{mode} Tr: the fill after the text object is still painted");
+    }
+    // Mode 7 is the case patch 64 already handled, and goes the same way.
+    assert_eq!(red_of(7), 1600, "7 Tr: likewise");
+    // And a mode that does not clip at all is unchanged.
+    assert_eq!(red_of(0), 1600, "0 Tr installs no clip");
 }
 
 /// A glyph the font has no outline for is not a glyph whose outline is empty. Both came back as
