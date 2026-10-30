@@ -7078,3 +7078,68 @@ fn a_glyph_shown_in_a_clipping_mode_clips_even_with_no_outline() {
         assert_eq!(red, want_red, "{content}");
     }
 }
+
+/// A glyph the font has no outline for is not a glyph whose outline is empty. Both came back as
+/// an empty `BezPath`, so a clipping mode installed an empty clip for a glyph id the font simply
+/// does not have and everything after `ET` disappeared (noted in review). An outline that
+/// resolves clips, even when it is empty -- the space case above -- and one that does not leaves
+/// what follows unclipped, since the real clip is unknown.
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+fn a_glyph_the_font_has_no_outline_for_leaves_the_clip_unknown() {
+    // The embedded font has three glyphs, so glyph 500 has no outline at all. Identity-H makes
+    // the character code the glyph id, so the content stream asks for it directly.
+    let font = symbolic_truetype_cmap::disagreeing_font();
+    let red = |code: &str| -> u32 {
+        let content = format!("q BT 7 Tr /F1 24 Tf 4 10 Td <{code}> Tj ET 1 0 0 rg 0 0 40 40 re f Q");
+        let objects: Vec<Vec<u8>> = vec![
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 40 40] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>".to_vec(),
+            [format!("<< /Length {} >>\nstream\n", content.len()).into_bytes(), content.clone().into_bytes(), b"\nendstream".to_vec()].concat(),
+            b"<< /Type /Font /Subtype /Type0 /BaseFont /AAAAAA+Sym /Encoding /Identity-H /DescendantFonts [8 0 R] >>".to_vec(),
+            b"<< /Type /FontDescriptor /FontName /AAAAAA+Sym /Flags 4 /FontBBox [0 0 1000 1000] /ItalicAngle 0 /Ascent 1000 /Descent 0 /CapHeight 1000 /StemV 80 /FontFile2 7 0 R >>".to_vec(),
+            [format!("<< /Length {} >>\nstream\n", font.len()).into_bytes(), font.clone(), b"\nendstream".to_vec()].concat(),
+            b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /AAAAAA+Sym /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor 6 0 R /DW 1000 /CIDToGIDMap /Identity >>".to_vec(),
+        ];
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::new();
+        for (i, object) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.extend(format!("{} 0 obj\n", i + 1).into_bytes());
+            pdf.extend(object);
+            pdf.extend(b"\nendobj\n");
+        }
+        let xref = pdf.len();
+        pdf.extend(format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).into_bytes());
+        for offset in offsets {
+            pdf.extend(format!("{offset:010} 00000 n \n").into_bytes());
+        }
+        pdf.extend(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", objects.len() + 1).into_bytes());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut r = PageRenderer::new(Arc::new(pdf), RenderConfig::default());
+            let _ = tx.send(r.render(RenderRequest { page: 0, kind: RequestKind::Pixels, tile: None, scale: 1.0, tag: 0, preview: false }));
+        });
+        let page = rx.recv_timeout(std::time::Duration::from_secs(60)).expect("the page must render");
+        assert!(page.error.is_none(), "glyph {code}: {:?}", page.error);
+        (0..page.width * page.height)
+            .filter(|i| {
+                let o = (*i * 4) as usize;
+                page.rgba[o] > 180 && page.rgba[o + 1] < 90
+            })
+            .count() as u32
+    };
+
+    // Glyph 500: no outline in a three-glyph font, so the clip is unknown and the fill is left
+    // alone. It used to clip to nothing, and the page came out blank.
+    assert_eq!(red("01F4"), 1600, "the fill after the text object is still painted");
+
+    // Glyph 1 is the font's own empty glyph: an outline that resolves with no segments. That
+    // clips to nothing, as a space does, so none of the fill shows.
+    assert_eq!(red("0001"), 0, "an empty outline still clips the fill away");
+
+    // Glyph 2 is a square, so the fill shows through its shape: some of the page, not all.
+    let square = red("0002");
+    assert!(square > 0 && square < 1600, "a real outline clips to its own shape: {square}");
+}

@@ -186,14 +186,25 @@ pub(crate) fn clip_glyph(context: &mut Context<'_>, glyph: &Glyph<'_>, transform
     // whether or not the glyph has an outline to clip to.
     context.get_mut().text_state.clip_shown = true;
     match glyph {
-        Glyph::Outline(o) => {
-            let outline = transform * o.outline();
-            let has_outline = outline.segments().next().is_some();
-
-            if has_outline {
-                context.get_mut().text_state.clip_paths.extend(outline);
+        // PdfCraft patch (64, extended): `try_outline`, not `outline`. A glyph the font has no
+        // outline for came back as an empty path, the same answer a space gives, so a clip mode
+        // installed an empty clip for it and nothing painted after `ET` -- the page lost content
+        // over a glyph id the font simply does not have (noted in review). An outline that
+        // resolved clips, even when it is empty; one that did not is unsupported, and `ET` then
+        // leaves what follows unclipped.
+        Glyph::Outline(o) => match o.try_outline() {
+            Some(outline) => {
+                let outline = transform * outline;
+                if outline.segments().next().is_some() {
+                    context.get_mut().text_state.clip_paths.extend(outline);
+                }
             }
-        }
+            None => {
+                warn!("no outline for a glyph shown in a clipping text rendering mode");
+                context.get_mut().text_state.clip_unsupported = true;
+                return;
+            }
+        },
         Glyph::Type3(_) => {
             warn!("text rendering mode clip not implemented for shape glyphs");
             // PdfCraft patch (64, extended): a Type 3 glyph adds nothing to the clipping path in
