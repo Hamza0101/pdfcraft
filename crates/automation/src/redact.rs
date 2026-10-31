@@ -116,18 +116,15 @@ impl Automation {
             // left that one in the saved file -- the same leak by a different route (noted in
             // review). The document's own states find it; all-ON finds what a hidden layer
             // holds; the marks are the union.
-            let layers = &self.doc(a)?.info.layers;
-            let (has_layers, any_hidden) = (!layers.is_empty(), layers.iter().any(|l| !l.visible));
+            let has_layers = !self.doc(a)?.info.layers.is_empty();
             let mut passes = vec![self.page_texts(id, &pages)?];
-            if any_hidden {
-                passes.push(self.page_texts_every_layer(id, &pages)?);
-            }
-            // And all off, for the `/P /AllOff` an `/OCMD` can carry: that is visible only when
-            // every group it lists is off, so a document with some on hides it from the all-on
-            // pass and from its own states alike (noted in review). The four `/OCMD` policies and
-            // a plain `/OC` are then all covered by one of the three passes.
+            // One more pass that ignores optional content altogether, which is what answers
+            // "what text does this file contain". Searching a *set* of layer states cannot:
+            // all on hides an `/OCMD /P /AnyOff`, all off hides `/P /AnyOn`, and a `/VE`
+            // expression like `[/And A [/Not B]]` is visible only in a mixed state, of which
+            // there are 2^n (all three noted in review).
             if has_layers {
-                passes.push(self.page_texts_all_layers_off(id, &pages)?);
+                passes.push(self.page_texts_every_layer(id, &pages)?);
             }
             let info = self.doc(a)?.info.clone();
             // The same text found by both passes is one mark. Quads come from the same

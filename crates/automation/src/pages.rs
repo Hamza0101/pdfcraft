@@ -132,41 +132,33 @@ impl Automation {
         Ok(p as usize - 1)
     }
 
-    /// Page text with every layer visible, for redaction's search. [`Self::page_texts`] returns
-    /// what the renderer shows, which leaves out content on a layer that is off -- so a search
-    /// for a word to redact never found it there, the user was told every match was marked, and
-    /// the word stayed in the saved file (#3646). Applying a mark already removes hidden content:
-    /// only the search missed it.
+    /// Page text with every optional content marker treated as visible, for redaction's search.
+    ///
+    /// [`Self::page_texts`] returns what the renderer shows, which leaves out content on a layer
+    /// that is off -- so a search for a word to redact never found it there, the user was told
+    /// every match was marked, and the word stayed in the saved file (#3646). Applying a mark
+    /// already removes hidden content: only the search missed it.
+    ///
+    /// Not a set of layer states, which cannot answer this. Forcing every group on hides an
+    /// `/OCMD` with `/P /AnyOff`; forcing them all off hides `/P /AnyOn`; and a `/VE`
+    /// visibility expression such as `[/And A [/Not B]]` is visible only in a mixed state, of
+    /// which there are 2^n (all three noted in review). Ignoring optional content answers
+    /// "what text does this file contain", which is the question redaction is asking.
     ///
     /// Not cached. The text cache holds what Find sees, and this is deliberately different.
     pub(crate) fn page_texts_every_layer(&mut self, id: DocId, pages: &[usize]) -> Result<Vec<Arc<PageText>>> {
-        self.page_texts_with_layers(id, pages, true)
-    }
-
-    /// Page text with every layer hidden. The companion to [`Self::page_texts_every_layer`]: an
-    /// `/OCMD` with `/P /AllOff` is visible only when all of its groups are off, so a document
-    /// where some are on hides it from both the all-on pass and its own states, and redaction's
-    /// search found it in neither (noted in review of #3646).
-    ///
-    /// Not cached, for the same reason as the all-on pass.
-    pub(crate) fn page_texts_all_layers_off(&mut self, id: DocId, pages: &[usize]) -> Result<Vec<Arc<PageText>>> {
-        self.page_texts_with_layers(id, pages, false)
-    }
-
-    fn page_texts_with_layers(&mut self, id: DocId, pages: &[usize], visible: bool) -> Result<Vec<Arc<PageText>>> {
         let doc = self.session.get(id).ok_or_else(|| failed("no such document"))?;
         let n = doc.info.pages.len();
         if let Some(p) = pages.iter().find(|p| **p >= n) {
             return Err(failed(format!("page {} is out of range", p + 1)));
         }
-        let on: Vec<(i32, i32, bool)> = doc.info.layers.iter().map(|l| (l.id.0 as i32, i32::from(l.id.1), visible)).collect();
         let bytes = doc.bytes.clone();
         let password: Option<Arc<str>> = doc.password.as_deref().map(Arc::from);
         // Keyed by page, then answered in the order the caller asked for: the parallel path
         // returns pages sorted, and the caller pairs this list with its own page list by
         // position. Redaction asks for the pages that hold matches, in match order, so a list
         // that isn't ascending would otherwise mark one page with another page's matches.
-        let texts: HashMap<usize, _> = extract_with_layers(&bytes, password, pages, Arc::new(on)).into_iter().collect();
+        let texts: HashMap<usize, _> = extract_showing_all_layers(&bytes, password, pages).into_iter().collect();
         pages
             .iter()
             .map(|p| match texts.get(p) {
@@ -371,13 +363,18 @@ pub(crate) fn encode_png(width: u32, height: u32, premultiplied: &[u8]) -> Resul
 
 /// Extract the text of `pages` (0-based) with one renderer per worker thread.
 pub(crate) fn extract_parallel(bytes: &Arc<Vec<u8>>, password: Option<Arc<str>>, pages: &[usize]) -> PageTexts {
-    extract_with_layers(bytes, password, pages, Arc::new(Vec::new()))
+    extract_text(bytes, password, pages, false)
 }
 
-/// [`extract_parallel`] with layer (optional content group) visibility overrides, so a caller can
-/// read text the renderer would leave out. Redaction's search uses it; see
+/// [`extract_parallel`] ignoring optional content, so a caller reads the text the file holds
+/// rather than the text a reader shows. Redaction's search uses it; see
 /// [`Session::page_texts_every_layer`].
-fn extract_with_layers(bytes: &Arc<Vec<u8>>, password: Option<Arc<str>>, pages: &[usize], layers: Arc<Vec<(i32, i32, bool)>>) -> PageTexts {
+fn extract_showing_all_layers(bytes: &Arc<Vec<u8>>, password: Option<Arc<str>>, pages: &[usize]) -> PageTexts {
+    extract_text(bytes, password, pages, true)
+}
+
+/// The shared body of [`extract_parallel`] and [`extract_showing_all_layers`].
+fn extract_text(bytes: &Arc<Vec<u8>>, password: Option<Arc<str>>, pages: &[usize], show_all_layers: bool) -> PageTexts {
     let extract = |r: &mut PageRenderer, p: usize| {
         let out = r.render(RenderRequest { page: p, kind: RequestKind::Text, tile: None, scale: 1.0, tag: 0, preview: false });
         match out.error {
@@ -385,7 +382,7 @@ fn extract_with_layers(bytes: &Arc<Vec<u8>>, password: Option<Arc<str>>, pages: 
             None => Ok(out.text.unwrap_or_default()),
         }
     };
-    let config = RenderConfig { password, layers, ..Default::default() };
+    let config = RenderConfig { password, show_all_layers, ..Default::default() };
     let workers = if cfg!(target_arch = "wasm32") { 1 } else { std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get).min(8) };
     // Small jobs aren't worth a second parse of the document.
     if workers == 1 || pages.len() < 8 {
